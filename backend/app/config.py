@@ -132,7 +132,8 @@ def secret(name: str) -> str:
 def public_url() -> str:
     """Address people use when the app is hosted (for example https://clipper.onrender.com).
     Empty when it runs on one computer. Hosted mode closes sign-up unless ALLOWED_EMAILS is set."""
-    return secret("PUBLIC_URL").rstrip("/")
+    # Render sets RENDER_EXTERNAL_URL itself, so a Render deploy needs no extra setting.
+    return (secret("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
 
 
 def allowed_emails() -> set[str]:
