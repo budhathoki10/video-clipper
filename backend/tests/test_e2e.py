@@ -782,3 +782,13 @@ def test_the_source_download_is_deleted_once_more_clips_are_stored(tmp_path, mon
     new = [c for c in db.query("SELECT * FROM clips WHERE job_id = 'more5'") if c["id"] != "more5-c1"]
     assert len(new) == 1 and new[0]["file"].startswith("s3:"), "the new clip was stored remotely"
     assert not source.exists(), "the downloaded source must not be left on the disk"
+
+
+def test_ping_route_is_public_and_does_no_work(monkeypatch):
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    with TestClient(app) as anonymous:
+        assert anonymous.get("/api/jobs").status_code == 401, "the rest of the API still needs an account"
+        for method in ("get", "head"):
+            response = getattr(anonymous, method)("/api/ping")
+            assert response.status_code == 200, method
+        assert anonymous.get("/api/ping").json() == {"ok": True}, "no state is returned"

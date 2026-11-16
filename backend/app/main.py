@@ -74,7 +74,7 @@ app.add_middleware(
 
 PUBLIC_API = {
     "/api/auth/google", "/api/auth/google/callback", "/api/auth/google/status", "/api/auth/logout",
-    "/api/health", "/api/docs", "/api/openapi.json",
+    "/api/health", "/api/ping", "/api/docs", "/api/openapi.json",
 }
 
 
@@ -225,6 +225,13 @@ def users(request: Request) -> dict[str, Any]:
 # ---- system ----------------------------------------------------------------
 @app.get("/api/health")
 def health() -> dict[str, bool]:
+    return {"ok": True}
+
+
+@app.api_route("/api/ping", methods=["GET", "HEAD"])
+async def ping() -> dict[str, bool]:
+    """For an external scheduler (cron) that keeps a hosted instance awake. Public, does no
+    work: no database, no worker check, nothing that could be slow or leak state."""
     return {"ok": True}
 
 
