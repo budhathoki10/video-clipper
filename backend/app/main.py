@@ -52,11 +52,14 @@ WORKER_CHECK_SECONDS = 15
 async def keep_worker_running() -> None:
     """The worker is a separate process. If it stops (crash, being killed, a restart
     race), start it again so queued jobs never wait for a worker that is gone."""
+    last_purge = 0.0
     while True:
         await asyncio.sleep(WORKER_CHECK_SECONDS)
         try:
             await asyncio.to_thread(ensure_worker)
-            await asyncio.to_thread(auth.purge_expired)
+            if time.time() - last_purge > 3600:  # once an hour: drop expired sessions and sign-in attempts
+                last_purge = time.time()
+                await asyncio.to_thread(auth.purge_expired)
         except Exception:
             pass  # try again on the next check
 
