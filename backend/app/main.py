@@ -1,19 +1,22 @@
 """Dashboard API. It only reads and writes the database and queues jobs;
-all heavy work happens in the separate worker process (app.worker)."""
+all heavy work happens in the separate worker process (app.worker).
+
+Everyone who signs in is an ordinary user with a private workspace: their own videos, clips, posts,
+settings, AI keys and YouTube channel. There is no administrator and nobody can see anyone else's work.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
-from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,10 +24,11 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, config, db, llm, runner, storage, worker, youtube
+from . import auth, config, db, keys, llm, runner, storage, worker, youtube
 from .pipeline import selection, trends
 
 ACTIVE = ("queued", "running", "stopping")
+MAX_ACTIVE_JOBS = 3  # videos one person may have in progress at once; there is no limit on their length
 
 
 def ensure_worker() -> bool:
@@ -35,6 +39,7 @@ def ensure_worker() -> bool:
     if os.name == "nt":
         flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
                  | subprocess.DETACHED_PROCESS)
+    config.DATA.mkdir(parents=True, exist_ok=True)
     log = open(config.DATA / "worker.log", "a", encoding="utf-8")
     subprocess.Popen([sys.executable, "-m", "app.worker"], cwd=config.BACKEND, stdout=log,
                      stderr=log, stdin=subprocess.DEVNULL, creationflags=flags, close_fds=True)
@@ -51,6 +56,7 @@ async def keep_worker_running() -> None:
         await asyncio.sleep(WORKER_CHECK_SECONDS)
         try:
             await asyncio.to_thread(ensure_worker)
+            await asyncio.to_thread(auth.purge_expired)
         except Exception:
             pass  # try again on the next check
 
@@ -81,7 +87,7 @@ PUBLIC_API = {
 
 @app.middleware("http")
 async def require_account(request: Request, call_next):
-    """The dashboard is static, so the API is the security boundary."""
+    """The dashboard is static, so the API is the security boundary: everyone must sign in."""
     path = request.url.path.rstrip("/") or "/"
     protected = path.startswith("/api/") and path not in PUBLIC_API
     if protected and request.method != "OPTIONS" and os.environ.get("CLIPPER_AUTH_DISABLED") != "1":
@@ -129,80 +135,57 @@ def fail(status: int, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail=message)
 
 
-# ---- who may see and change what ---------------------------------------------
-# Everyone with a Google account can sign in and make clips. Each person sees only their own
-# videos, clips and settings. The owner (an administrator) sees everything and is the only one who
-# can change keys, the AI engine and the YouTube channel, or post to that channel.
-MAX_ACTIVE_JOBS = 2  # videos one person may have in progress at once (the owner is not limited)
-MAX_MINUTES_FOR_GUESTS = 90
+# ---- whose work is whose -----------------------------------------------------
+LOCAL_USER = "local"  # who everything belongs to when sign-in is switched off (local development)
 
 
-def _me(request: Request) -> dict[str, Any] | None:
-    return getattr(request.state, "user", None)
+def _uid(request: Request) -> str:
+    user = getattr(request.state, "user", None)
+    return user["id"] if user else LOCAL_USER
 
 
-def _is_admin(request: Request) -> bool:
-    user = _me(request)
-    return user is None or bool(user["is_admin"])  # no user: sign-in is switched off (local development)
+def _mine(request: Request) -> dict[str, Any]:
+    """Query filter that limits a collection to the signed-in person's own documents. Another
+    person's work looks exactly like work that does not exist. With sign-in switched off (local
+    development only) there is one implicit user and nothing is filtered."""
+    return {"user_id": request.state.user["id"]} if getattr(request.state, "user", None) else {}
 
 
-def _user_id(request: Request) -> str | None:
-    user = _me(request)
-    return user["id"] if user else None
-
-
-def _require_admin(request: Request, message: str) -> None:
-    if not _is_admin(request):
-        raise fail(403, message)
-
-
-def _visible(request: Request, alias: str = "j") -> tuple[str, tuple]:
-    """SQL that limits a query on jobs to the signed-in person's own (the owner sees all)."""
-    if _is_admin(request):
-        return "", ()
-    return f" AND {alias}.user_id = ?", (_user_id(request),)
-
-
-def _job_for(request: Request, job_id: str, columns: str = "j.*") -> dict[str, Any]:
-    scope, extra = _visible(request)
-    job = db.one(f"SELECT {columns} FROM jobs j WHERE j.id = ?{scope}", (job_id, *extra))
-    if not job:  # someone else's job looks exactly like one that does not exist
+def _job_for(request: Request, job_id: str) -> dict[str, Any]:
+    job = db.find_one("jobs", {"id": job_id, **_mine(request)})
+    if not job:
         raise fail(404, "That job does not exist.")
     return job
 
 
-def _clip_for(request: Request, clip_id: str, columns: str = "c.*") -> dict[str, Any]:
-    scope, extra = _visible(request)
-    clip = db.one(f"SELECT {columns} FROM clips c LEFT JOIN jobs j ON j.id = c.job_id "
-                  f"WHERE c.id = ?{scope}", (clip_id, *extra))
+def _clip_for(request: Request, clip_id: str) -> dict[str, Any]:
+    clip = db.find_one("clips", {"id": clip_id, **_mine(request)})
     if not clip:
         raise fail(404, "That clip does not exist.")
     return clip
 
 
-def _owner_of_job(job_id: str) -> str | None:
-    row = db.one("SELECT user_id FROM jobs WHERE id = ?", (job_id,))
-    return row["user_id"] if row else None
-
-
 def _check_quota(request: Request) -> None:
-    if _is_admin(request):
-        return
-    busy = db.one("SELECT COUNT(*) AS n FROM jobs WHERE user_id = ? AND kind IN ('auto','video','more','live') "
-                  "AND status IN ('queued','running','stopping')", (_user_id(request),))["n"]
+    busy = db.count("jobs", {**_mine(request), "kind": {"$in": ["auto", "video", "more", "live"]},
+                             "status": {"$in": list(ACTIVE)}})
     if busy >= MAX_ACTIVE_JOBS:
         raise fail(429, f"You already have {MAX_ACTIVE_JOBS} videos in progress. "
                         "Wait for one to finish, then add the next.")
 
 
-def queue_job(kind: str, *, url: str | None = None, options: dict | None = None,
-              payload: dict | None = None, title: str | None = None,
-              user_id: str | None = None) -> dict[str, Any]:
+def queue_job(kind: str, *, user_id: str, url: str | None = None, options: dict | None = None,
+              payload: dict | None = None, title: str | None = None) -> dict[str, Any]:
     job = {"id": db.new_id(), "kind": kind, "url": url, "status": "queued", "step": "Queued",
            "progress": 0, "title": title, "options": options or {}, "payload": payload or {},
            "created_at": time.time(), "updated_at": time.time(), "user_id": user_id}
     db.insert("jobs", job)
     ensure_worker()
+    return job
+
+
+def _job_out(job: dict[str, Any]) -> dict[str, Any]:
+    for internal in ("options", "files", "user_id", "_id"):
+        job.pop(internal, None)  # settings snapshots and storage references stay on the server
     return job
 
 
@@ -218,31 +201,24 @@ def clip_out(clip: dict[str, Any]) -> dict[str, Any]:
                               if clip.get(key) else None)
     clip.pop("file", None)  # internal storage references are never sent to the browser
     clip.pop("thumb", None)
+    clip.pop("user_id", None)
     clip["duration"] = round((clip.get("end") or 0) - (clip.get("start") or 0), 2)
     return clip
 
 
 # ---- accounts --------------------------------------------------------------
+def _base_url(request: Request) -> str:
+    """The address people use. Behind a hosting proxy the request's own address is internal, so
+    PUBLIC_URL wins when it is set."""
+    return config.public_url() or str(request.base_url).rstrip("/")
+
+
 def _set_session(response: Response, token: str, request: Request) -> None:
     secure = request.url.scheme == "https" or config.public_url().startswith("https://")
     response.set_cookie(
         auth.SESSION_COOKIE, token, max_age=auth.SESSION_DAYS * 86400,
         httponly=True, secure=secure, samesite="lax", path="/",
     )
-
-
-def _callback_uri(request: Request, route: str) -> str:
-    """Google must send the browser back to the address people actually use. Behind a hosting
-    proxy the request's own address is internal, so PUBLIC_URL wins when it is set."""
-    base = config.public_url()
-    return f"{base}{request.app.url_path_for(route)}" if base else str(request.url_for(route))
-
-
-def _require_admin_when_hosted(request: Request) -> None:
-    # One channel is connected for the whole app, so on a shared server only the owner may change it.
-    user = getattr(request.state, "user", None)
-    if config.public_url() and not (user and user["is_admin"]):
-        raise fail(403, "Only the administrator can change the YouTube connection.")
 
 
 @app.get("/api/auth/google/status")
@@ -256,11 +232,11 @@ def google_auth_start(request: Request):
     if oauth_config is None:
         query = urlencode({"error": "Google sign-in is not configured yet."})
         return RedirectResponse(f"/login/?{query}", status_code=303)
-    redirect_uri = _callback_uri(request, "google_auth_callback")
+    redirect_uri = f"{_base_url(request)}/api/auth/google/callback"
     try:
         url = auth.google_authorization_url(oauth_config, redirect_uri)
     except Exception:
-        query = urlencode({"error": "Google sign-in could not be started. Check Google OAuth in backend/.env."})
+        query = urlencode({"error": "Google sign-in could not be started. Try again in a moment."})
         return RedirectResponse(f"/login/?{query}", status_code=303)
     return RedirectResponse(url, status_code=303)
 
@@ -294,15 +270,8 @@ def logout_account(request: Request, response: Response) -> None:
 
 @app.get("/api/auth/me")
 def current_account(request: Request) -> dict[str, Any]:
-    user = request.state.user
-    return {"user": user, "stats": auth.stats() if user["is_admin"] else None}
-
-
-@app.get("/api/users")
-def users(request: Request) -> dict[str, Any]:
-    if not request.state.user["is_admin"]:
-        raise fail(403, "Only the administrator can view users.")
-    return {"stats": auth.stats(), "users": auth.list_users()}
+    return {"user": getattr(request.state, "user", None) or
+            {"id": LOCAL_USER, "email": "", "name": "Local", "avatar_url": ""}}
 
 
 # ---- system ----------------------------------------------------------------
@@ -318,38 +287,35 @@ async def ping() -> dict[str, bool]:
     return {"ok": True}
 
 
-def _youtube_status(request: Request) -> dict[str, Any]:
-    status = youtube.status()
-    if not _is_admin(request):
-        status["auth_url"] = ""  # the owner's sign-in link is for the owner
-    return status
-
-
 @app.get("/api/system")
 def system(request: Request) -> dict[str, Any]:
-    settings = db.get_settings()
+    uid = _uid(request)
+    settings = db.settings_for(uid)
     provider = settings["ai"]["provider"]
     secret_name = config.PROVIDER_SECRET.get(provider)
+    try:
+        ready = True if secret_name is None else bool(keys.effective(uid, secret_name))
+    except keys.KeysError:
+        ready = False
     return {
         "worker_alive": worker.is_alive(),
         "provider": provider,
         "model": settings["ai"]["models"].get(provider),
-        "ai_ready": True if secret_name is None else bool(config.secret(secret_name)),
-        "youtube": _youtube_status(request),
+        "ai_ready": ready,
+        "youtube": youtube.status(uid),
     }
 
 
 @app.post("/api/system/start-worker")
-def start_worker(request: Request) -> dict[str, bool]:
-    _require_admin(request, "Only the owner of this app can restart the worker.")
+def start_worker() -> dict[str, bool]:
     return {"started": ensure_worker()}
 
 
 @app.post("/api/ai/test")
 def ai_test(request: Request) -> dict[str, Any]:
-    _require_admin(request, "Only the owner of this app can test the AI connection.")
     try:
-        return llm.ping()
+        with llm.as_user(_uid(request)):
+            return llm.ping()
     except llm.LLMError as exc:
         raise fail(502, str(exc)) from None
 
@@ -357,23 +323,23 @@ def ai_test(request: Request) -> dict[str, Any]:
 # ---- jobs ------------------------------------------------------------------
 @app.get("/api/jobs")
 def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
-    scope, extra = _visible(request)
-    rows = db.query(
-        "SELECT j.*, (SELECT COUNT(*) FROM clips c WHERE c.job_id = j.id AND c.status = 'ready') "
-        f"AS clip_count FROM jobs j WHERE j.kind IN ('auto','video','live'){scope} "
-        "ORDER BY j.created_at DESC LIMIT 200", extra)
+    rows = db.find("jobs", {**_mine(request), "kind": {"$in": ["auto", "video", "live"]}},
+                   sort=[("created_at", -1)], limit=200)
+    ready: dict[str, int] = {}
+    for clip in db.find("clips", {**_mine(request), "status": "ready"}, fields=["job_id"]):
+        ready[clip["job_id"]] = ready.get(clip["job_id"], 0) + 1
     newest_more: dict[str, dict[str, Any]] = {}
-    for item in db.query("SELECT id, status, step, progress, error, payload, created_at FROM jobs "
-                         "WHERE kind = 'more' ORDER BY created_at"):
+    for item in db.find("jobs", {**_mine(request), "kind": "more"}, sort=[("created_at", 1)]):
         source = (item["payload"] or {}).get("source_job_id")
         if source:
             newest_more[source] = item  # later rows replace earlier ones
     for row in rows:
-        row.pop("options", None)
+        row["clip_count"] = ready.get(row["id"], 0)
         item = newest_more.get(row["id"])
         if item and (item["status"] in ACTIVE or (item["status"] == "failed" and time.time() - item["created_at"] < 3600)):
             row["more"] = {"id": item["id"], "status": item["status"], "step": item["step"],
                            "progress": item["progress"], "error": item["error"]}
+        _job_out(row)
     return [r for r in rows if not kind or r["kind"] == kind]
 
 
@@ -382,19 +348,21 @@ def create_job(body: JobCreate, request: Request) -> dict[str, Any]:
     url = body.url.strip()
     if not re.match(r"^https?://[^\s]+$", url):
         raise fail(422, "Paste a full link that starts with https://")
-    allowed = {k: body.options[k] for k in ("clip", "format", "captions", "overlay", "live", "max_minutes")
-               if k in body.options}
-    options = config.deep_merge(db.settings_for(_user_id(request)), allowed)
+    allowed = {k: config.prune_to(config.DEFAULT_SETTINGS[k], body.options[k])
+               for k in ("clip", "format", "captions", "overlay", "live") if isinstance(body.options.get(k), dict)}
+    if isinstance(body.options.get("max_minutes"), (int, float)) and body.options["max_minutes"] > 0:
+        allowed["max_minutes"] = body.options["max_minutes"]
+    options = config.deep_merge(db.settings_for(_uid(request)), allowed)
     clip = options["clip"]
     if clip["min_sec"] > clip["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
+    try:
+        storage.require_when_hosted()
+    except storage.StorageError as exc:
+        raise fail(503, str(exc)) from None
     _check_quota(request)
-    if not _is_admin(request):
-        options["max_minutes"] = min(int(options.get("max_minutes") or MAX_MINUTES_FOR_GUESTS),
-                                     MAX_MINUTES_FOR_GUESTS)
-    job = queue_job("auto", url=url, options=options, user_id=_user_id(request))
-    job.pop("options")
-    return job
+    job = queue_job("auto", url=url, options=options, user_id=_uid(request))
+    return _job_out(job)
 
 
 class MoreClips(BaseModel):
@@ -410,31 +378,30 @@ def more_clips(job_id: str, body: MoreClips, request: Request) -> dict[str, Any]
         raise fail(404, "That video does not exist.")
     if job["status"] != "done":
         raise fail(409, "Wait until this video has finished processing.")
-    folder = config.JOBS_DIR / job_id
-    if not (folder / "transcript.json").exists() or not (folder / "meta.json").exists():
+    kept = (job.get("files") or {}).get("artifacts") or (runner.job_dir(job_id) / "transcript.json").exists()
+    if not kept:
         raise fail(409, "The working files for this video were removed, so more clips cannot be made "
                         "from it. Add the link again.")
-    for running in db.query("SELECT payload FROM jobs WHERE kind = 'more' AND status IN ('queued','running','stopping')"):
-        if (running["payload"] or {}).get("source_job_id") == job_id:
-            raise fail(409, "More clips are already being made from this video.")
+    if db.count("jobs", {"kind": "more", "status": {"$in": list(ACTIVE)}, "payload.source_job_id": job_id}):
+        raise fail(409, "More clips are already being made from this video.")
     _check_quota(request)
-    created = queue_job("more", title=job["title"], user_id=job["user_id"], payload={
+    created = queue_job("more", title=job["title"], user_id=_uid(request), payload={
         "source_job_id": job_id, "count": body.count, "label_part": body.label_part})
     return {"id": created["id"], "status": created["status"]}
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str, request: Request) -> dict[str, Any]:
-    job = _job_for(request, job_id)
-    job.pop("options", None)
-    job["clips"] = [clip_out(c) for c in db.query(
-        "SELECT * FROM clips WHERE job_id = ? ORDER BY COALESCE(panel_score, ai_score, 0) DESC", (job_id,))]
+    job = _job_out(_job_for(request, job_id))
+    clips = db.find("clips", {"job_id": job_id, **_mine(request)})
+    clips.sort(key=lambda c: c.get("panel_score") or c.get("ai_score") or 0, reverse=True)
+    job["clips"] = [clip_out(c) for c in clips]
     return job
 
 
 @app.post("/api/jobs/{job_id}/stop")
 def stop_job(job_id: str, request: Request) -> dict[str, str]:
-    job = _job_for(request, job_id, "j.kind, j.status")
+    job = _job_for(request, job_id)
     if job["status"] not in ACTIVE:
         return {"status": job["status"]}
     # A live watch stops cleanly and keeps its clips; anything else is cancelled.
@@ -445,7 +412,7 @@ def stop_job(job_id: str, request: Request) -> dict[str, str]:
 
 @app.post("/api/jobs/{job_id}/retry")
 def retry_job(job_id: str, request: Request) -> dict[str, str]:
-    job = _job_for(request, job_id, "j.status")
+    job = _job_for(request, job_id)
     if job["status"] not in ("failed", "cancelled"):
         raise fail(409, "Only failed or cancelled jobs can be retried.")
     _check_quota(request)
@@ -456,33 +423,29 @@ def retry_job(job_id: str, request: Request) -> dict[str, str]:
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
 def delete_job(job_id: str, request: Request) -> None:
-    job = _job_for(request, job_id, "j.status")
+    job = _job_for(request, job_id)
     if job["status"] in ("running", "stopping"):
         raise fail(409, "Stop the job before deleting it.")
-    for stored in db.query("SELECT file, thumb FROM clips WHERE job_id = ?", (job_id,)):
-        storage.delete(stored["file"])
-        storage.delete(stored["thumb"])
-    db.execute("DELETE FROM clips WHERE job_id = ?", (job_id,))
-    db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    runner.delete_job_files(job_id)
+    for stored in db.find("clips", {"job_id": job_id}, fields=["file", "thumb"]):
+        storage.delete(stored.get("file"))
+        storage.delete(stored.get("thumb"))
+    db.delete("clips", {"job_id": job_id})
+    db.delete("jobs", {"id": job_id})
+    runner.delete_job_files(job_id, job.get("files"))
 
 
 # ---- clips -----------------------------------------------------------------
 @app.get("/api/clips")
 def list_clips(request: Request, job_id: str | None = None) -> list[dict[str, Any]]:
-    scope, extra = _visible(request)
-    sql = f"SELECT c.* FROM clips c LEFT JOIN jobs j ON j.id = c.job_id WHERE 1 = 1{scope}"
-    params = extra
-    if job_id:
-        sql, params = sql + " AND c.job_id = ?", (*extra, job_id)
-    return [clip_out(c) for c in db.query(sql + " ORDER BY c.created_at DESC LIMIT 500", params)]
+    filt = {**_mine(request), **({"job_id": job_id} if job_id else {})}
+    return [clip_out(c) for c in db.find("clips", filt, sort=[("created_at", -1)], limit=500)]
 
 
 @app.get("/api/clips/{clip_id}")
 def get_clip(clip_id: str, request: Request) -> dict[str, Any]:
-    clip = _clip_for(request, clip_id)
-    out = clip_out(clip)
-    out["posts"] = db.query("SELECT * FROM posts WHERE clip_id = ? ORDER BY created_at DESC", (clip_id,))
+    out = clip_out(_clip_for(request, clip_id))
+    out["posts"] = [_post_out(p) for p in db.find("posts", {"clip_id": clip_id, **_mine(request)},
+                                                  sort=[("created_at", -1)])]
     return out
 
 
@@ -502,7 +465,8 @@ def patch_clip(clip_id: str, body: ClipPatch, request: Request) -> dict[str, Any
     values.update(start=start, end=end)
     if body.settings:
         opts = clip["options"]
-        allowed = {k: body.settings[k] for k in ("format", "captions", "overlay") if k in body.settings}
+        allowed = {k: config.prune_to(config.DEFAULT_SETTINGS[k], body.settings[k])
+                   for k in ("format", "captions", "overlay") if isinstance(body.settings.get(k), dict)}
         opts["settings"] = config.deep_merge(opts["settings"], allowed)
         values["options"] = opts
     db.update("clips", clip_id, **values)
@@ -511,7 +475,7 @@ def patch_clip(clip_id: str, body: ClipPatch, request: Request) -> dict[str, Any
             raise fail(409, "This clip is already rendering.")
         db.update("clips", clip_id, status="rendering", created_at=time.time())
         queue_job("render", payload={"clip_id": clip_id, "rescore": body.rescore},
-                  title=values.get("title") or clip["title"], user_id=_owner_of_job(clip["job_id"]))
+                  title=values.get("title") or clip["title"], user_id=_uid(request))
     return get_clip(clip_id, request)
 
 
@@ -521,13 +485,18 @@ def suggest_clip_hooks(clip_id: str, request: Request) -> dict[str, list[str]]:
     clip = _clip_for(request, clip_id)
     opts = clip["options"] or {}
     spoken = ""
+    try:
+        runner.restore_job_files(clip["job_id"])
+    except storage.StorageError:
+        pass  # without the transcript the hooks are written from the title alone
     transcript = config.DATA / opts.get("words", "")
     if opts.get("words") and transcript.exists():
         words = json.loads(transcript.read_text(encoding="utf-8")).get("words", [])
         spoken = " ".join(w["w"] for w in words if clip["start"] <= w["s"] <= clip["end"])
     try:
-        hooks = selection.suggest_hooks(title=clip["title"] or "", spoken=spoken,
-                                        trends=opts.get("trend_brief", ""))
+        with llm.as_user(_uid(request)):
+            hooks = selection.suggest_hooks(title=clip["title"] or "", spoken=spoken,
+                                            trends=opts.get("trend_brief", ""))
     except llm.LLMError as exc:
         raise fail(502, str(exc)) from None
     if not hooks:
@@ -537,26 +506,27 @@ def suggest_clip_hooks(clip_id: str, request: Request) -> dict[str, list[str]]:
 
 @app.delete("/api/clips/{clip_id}", status_code=204)
 def delete_clip(clip_id: str, request: Request) -> None:
-    clip = _clip_for(request, clip_id, "c.file, c.thumb")
+    clip = _clip_for(request, clip_id)
     for key in ("file", "thumb"):
-        if storage.is_remote(clip[key]):
+        if storage.is_remote(clip.get(key)):
             storage.delete(clip[key])
-        elif clip[key]:
+        elif clip.get(key):
             (config.DATA / clip[key]).unlink(missing_ok=True)
-    db.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
+    db.delete("clips", {"id": clip_id})
 
 
 def _serve_file(request: Request, clip_id: str, column: str, *, download_as: str | None = None):
-    clip = _clip_for(request, clip_id, f"c.title, c.{column} AS ref")
-    if not clip["ref"]:
+    clip = _clip_for(request, clip_id)
+    ref = clip.get(column)
+    if not ref:
         raise fail(404, "The clip file is missing.")
-    if storage.is_remote(clip["ref"]):
+    if storage.is_remote(ref):
         try:
-            link = storage.url(clip["ref"], download_name=download_as)
+            link = storage.url(ref, download_name=download_as)
         except storage.StorageError as exc:
             raise fail(502, str(exc)) from None
         return RedirectResponse(link, status_code=307)
-    path = config.DATA / clip["ref"]
+    path = config.DATA / ref
     if not path.exists():
         raise fail(404, "The clip file is missing.")
     media_type = "video/mp4" if column == "file" else "image/jpeg"
@@ -575,153 +545,126 @@ def clip_thumb(clip_id: str, request: Request):
 
 @app.get("/api/clips/{clip_id}/download")
 def download_clip(clip_id: str, request: Request):
-    clip = _clip_for(request, clip_id, "c.title")
+    clip = _clip_for(request, clip_id)
     name = re.sub(r'[\\/:*?"<>|]+', "", clip["title"] or "clip").strip()[:80] or "clip"
     return _serve_file(request, clip_id, "file", download_as=f"{name}.mp4")
 
 
-@app.post("/api/storage/migrate", status_code=202)
-def storage_migrate(request: Request) -> dict[str, Any]:
-    _require_admin(request, "Only the owner of this app can move stored clips.")
-    if not storage.enabled():
-        raise fail(409, "Storage is not set up. Add the storage keys and bucket to backend/.env.")
-    running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'migrate' AND status IN ('queued','running')")
-    if not running["n"]:
-        queue_job("migrate", title="Move clips to cloud storage")
-    return {"clips": storage.local_clip_count()}
-
-
-@app.post("/api/storage/test")
-def storage_test(request: Request) -> dict[str, Any]:
-    _require_admin(request, "Only the owner of this app can test storage.")
-    try:
-        return storage.check()
-    except storage.StorageError as exc:
-        raise fail(502, str(exc)) from None
-
-
-# ---- settings and secrets --------------------------------------------------
-HIDDEN_SETTINGS = ("storage",)  # server-side configuration, not part of the user's settings
+# ---- settings and keys -----------------------------------------------------
+HIDDEN_SETTINGS = ("storage",)  # server-side configuration, not part of anyone's settings
 
 
 def _public_settings(request: Request) -> dict[str, Any]:
-    return {k: v for k, v in db.settings_for(_user_id(request) if not _is_admin(request) else None).items()
-            if k not in HIDDEN_SETTINGS}
+    return {k: v for k, v in db.settings_for(_uid(request)).items() if k not in HIDDEN_SETTINGS}
 
 
-def _secret_view(request: Request) -> dict[str, Any]:
-    status = config.secret_status()
-    if _is_admin(request):
-        return status
-    return {name: {"set": item["set"], "hint": ""} for name, item in status.items()}  # no key fragments
+def _key_status(request: Request) -> dict[str, Any]:
+    try:
+        return keys.status(_uid(request))
+    except keys.KeysError:
+        return {name: {"set": False, "hint": "", "shared": False} for name in config.PUBLIC_SECRETS}
 
 
 @app.get("/api/settings")
 def get_settings(request: Request) -> dict[str, Any]:
-    return {"settings": _public_settings(request), "secrets": _secret_view(request)}
+    return {"settings": _public_settings(request), "secrets": _key_status(request)}
 
 
 @app.put("/api/settings")
 def put_settings(patch: dict[str, Any], request: Request) -> dict[str, Any]:
-    owner = _is_admin(request)
-    # The owner edits the app-wide settings. Everyone else edits only their own copy of the
-    # clip, format, caption, overlay and live choices.
-    editable = config.DEFAULT_SETTINGS if owner else db.USER_SETTINGS
-    allowed = {k: v for k, v in patch.items()
-               if k in editable and k not in HIDDEN_SETTINGS and isinstance(v, dict)}
-    merged = config.deep_merge(db.settings_for(None if owner else _user_id(request)), allowed)
+    allowed = {k: config.prune_to(config.DEFAULT_SETTINGS[k], v)
+               for k, v in patch.items() if k in db.USER_SETTINGS and isinstance(v, dict)}
+    merged = config.deep_merge(db.settings_for(_uid(request)), allowed)
     if merged["ai"]["provider"] not in config.PROVIDER_SECRET:
         raise fail(422, "Unknown AI provider.")
     if merged["clip"]["min_sec"] > merged["clip"]["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
     if merged["clip"]["min_sec"] < 5 or merged["clip"]["max_sec"] > 180:
         raise fail(422, "Clip length must be between 5 seconds and 3 minutes.")
-    if owner:
-        db.save_settings(allowed)
-    else:
-        db.save_prefs(_user_id(request), allowed)
-    return {"settings": _public_settings(request), "secrets": _secret_view(request)}
+    db.save_prefs(_uid(request), allowed)
+    return {"settings": _public_settings(request), "secrets": _key_status(request)}
 
 
 @app.put("/api/secrets")
 def put_secret(body: SecretUpdate, request: Request) -> dict[str, Any]:
-    _require_admin(request, "Only the owner of this app can change the AI keys.")
+    """Save (or, with an empty value, remove) this person's own API key."""
     if body.name not in config.PUBLIC_SECRETS:
         raise fail(422, "That key cannot be changed here.")
     try:
-        config.set_secret(body.name, body.value)
-    except ValueError as exc:
+        keys.put(_uid(request), body.name, body.value)
+    except keys.KeysError as exc:
         raise fail(422, str(exc)) from None
-    return config.secret_status()
+    return _key_status(request)
 
 
 # ---- trends ----------------------------------------------------------------
 @app.get("/api/trends")
 def get_trends() -> dict[str, Any]:
-    running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'trends' AND status IN ('queued','running')")
-    failed = db.one("SELECT error FROM jobs WHERE kind = 'trends' ORDER BY created_at DESC LIMIT 1")
-    return {"data": trends.current(), "refreshing": running["n"] > 0,
-            "error": (failed or {}).get("error")}
+    running = db.count("jobs", {"kind": "trends", "status": {"$in": ["queued", "running"]}})
+    failed = db.find("jobs", {"kind": "trends"}, sort=[("created_at", -1)], limit=1)
+    return {"data": trends.current(), "refreshing": running > 0,
+            "error": (failed[0] if failed else {}).get("error")}
 
 
 @app.post("/api/trends/refresh", status_code=202)
 def refresh_trends(request: Request) -> dict[str, str]:
-    _require_admin(request, "Only the owner of this app can refresh trends.")
-    running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'trends' AND status IN ('queued','running')")
-    if not running["n"]:
-        queue_job("trends", title="Trend refresh")
+    if not db.count("jobs", {"kind": "trends", "status": {"$in": ["queued", "running"]}}):
+        queue_job("trends", title="Trend refresh", user_id=_uid(request))
     return {"status": "queued"}
 
 
-# ---- YouTube ---------------------------------------------------------------
+# ---- YouTube (each person connects their own channel) ---------------------------
 @app.get("/api/youtube")
 def youtube_status(request: Request) -> dict[str, Any]:
-    return _youtube_status(request)
+    return youtube.status(_uid(request))
 
 
 @app.post("/api/youtube/connect", status_code=202)
 def youtube_connect(request: Request) -> dict[str, Any]:
-    _require_admin_when_hosted(request)
     try:
-        if youtube.hosted():
-            return {**youtube.status(), "connecting": True, "redirect_to": youtube.start_web_connect()}
-        youtube.connect_in_background()
+        url = youtube.start_connect(_uid(request), _base_url(request))
     except youtube.YouTubeError as exc:
         raise fail(409, str(exc)) from None
-    return {**youtube.status(), "connecting": True}
+    return {**youtube.status(_uid(request)), "connecting": True, "redirect_to": url}
 
 
 @app.get("/api/youtube/callback")
 def youtube_callback(request: Request, state: str = "", code: str = "", error: str = ""):
-    """Where Google sends the browser back to after a hosted channel sign-in."""
-    _require_admin_when_hosted(request)
+    """Where Google sends the browser back to after a channel sign-in."""
+    uid = _uid(request)
     if error or not code:
-        message = ("The YouTube sign-in did not finish. Press Connect YouTube again."
-                   if error and error != "access_denied" else "The YouTube sign-in was cancelled.")
-        db.kv_set("youtube", {"error": message})
+        youtube.record_error(uid, "The YouTube sign-in did not finish. Press Connect YouTube again."
+                             if error and error != "access_denied" else "The YouTube sign-in was cancelled.")
     else:
         try:
-            youtube.finish_web_connect(state, code)
+            youtube.finish_connect(uid, state, code)
         except youtube.YouTubeError as exc:
-            db.kv_set("youtube", {"error": str(exc)})
+            youtube.record_error(uid, str(exc))
     return RedirectResponse("/settings/#youtube", status_code=303)
 
 
 @app.post("/api/youtube/disconnect")
 def youtube_disconnect(request: Request) -> dict[str, Any]:
-    _require_admin_when_hosted(request)
-    youtube.disconnect()
-    return youtube.status()
+    youtube.disconnect(_uid(request))
+    return youtube.status(_uid(request))
 
 
 # ---- posts -----------------------------------------------------------------
+def _post_out(post: dict[str, Any]) -> dict[str, Any]:
+    post.pop("user_id", None)
+    return post
+
+
 @app.get("/api/posts")
 def list_posts(request: Request) -> list[dict[str, Any]]:
-    if not _is_admin(request):
-        return []  # only the owner posts, to the owner's own channel
-    return db.query(
-        "SELECT p.*, c.thumb AS thumb, c.panel_score AS panel_score FROM posts p "
-        "LEFT JOIN clips c ON c.id = p.clip_id ORDER BY p.created_at DESC LIMIT 300")
+    posts = db.find("posts", _mine(request), sort=[("created_at", -1)], limit=300)
+    clips = {c["id"]: c for c in db.find("clips", {"id": {"$in": [p["clip_id"] for p in posts]}},
+                                         fields=["id", "thumb", "panel_score"])}
+    for post in posts:
+        clip = clips.get(post["clip_id"], {})
+        post["thumb"], post["panel_score"] = clip.get("thumb"), clip.get("panel_score")
+        _post_out(post)
+    return posts
 
 
 SHORT_MAX_SEC = 180
@@ -756,14 +699,11 @@ def _with_kind_tag(description: str, kind: str) -> str:
 
 @app.post("/api/posts", status_code=201)
 def create_post(body: PostCreate, request: Request) -> dict[str, Any]:
-    _require_admin(request, "Only the owner of this app can post to the connected YouTube channel. "
-                            "Download your clip and upload it to your own channel.")
-    clip = db.one("SELECT * FROM clips WHERE id = ?", (body.clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+    uid = _uid(request)
+    clip = _clip_for(request, body.clip_id)
     if clip["status"] != "ready":
         raise fail(409, "Wait until the clip has finished rendering.")
-    if not youtube.status()["connected"]:
+    if not youtube.status(uid)["connected"]:
         raise fail(409, "Connect your YouTube channel in Settings before posting.")
     kind = _check_kind(clip, body.kind)
     publish_at = None
@@ -780,28 +720,26 @@ def create_post(body: PostCreate, request: Request) -> dict[str, Any]:
             raise fail(422, "The schedule time must be in the future.")
         publish_at = when.astimezone(timezone.utc).isoformat()
     post = {
-        "id": db.new_id(), "clip_id": clip["id"], "status": "uploading",
+        "id": db.new_id(), "clip_id": clip["id"], "user_id": uid, "status": "uploading",
         "title": (body.title or clip["title"] or "Clip")[:100],
         "description": _with_kind_tag(
             body.description if body.description is not None else clip["description"] or "", kind),
         "kind": kind,
-        "privacy": body.privacy or db.get_settings()["posting"]["privacy"],
+        "privacy": body.privacy or db.settings_for(uid)["posting"]["privacy"],
         "publish_at": publish_at, "created_at": time.time(), "updated_at": time.time(),
-        "user_id": _user_id(request),
     }
     db.insert("posts", post)
-    queue_job("upload", payload={"post_id": post["id"]}, title=post["title"], user_id=_user_id(request))
-    return post
+    queue_job("upload", payload={"post_id": post["id"]}, title=post["title"], user_id=uid)
+    return _post_out(post)
 
 
 @app.delete("/api/posts/{post_id}", status_code=204)
 def delete_post(post_id: str, request: Request) -> None:
     """Removes the record here. It does not delete the video from YouTube."""
-    _require_admin(request, "Only the owner of this app can remove posts.")
-    db.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+    db.delete("posts", {"id": post_id, **_mine(request)})
 
 
-# ---- static: clip files and the built dashboard ----------------------------
+# ---- static: caption fonts and the built dashboard --------------------------
 config.ensure_dirs()
 if (config.BACKEND / "assets" / "fonts").is_dir():  # caption fonts, for the Settings preview
     app.mount("/fonts", StaticFiles(directory=config.BACKEND / "assets" / "fonts"), name="fonts")

@@ -1,6 +1,6 @@
 "use client";
 
-import { Clapperboard, Film, House, LogOut, Radio, Send, Settings, TrendingUp, UsersRound } from "lucide-react";
+import { Clapperboard, Film, House, LogOut, Radio, Send, Settings, TrendingUp } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
@@ -19,7 +19,6 @@ const NAV = [
 
 const MAIN_NAV = NAV.slice(0, -1);
 const SETTINGS_NAV = NAV[NAV.length - 1];
-const USERS_NAV = { href: "/users/", label: "Users", icon: UsersRound };
 
 const PROVIDER_NAMES = { nvidia: "NVIDIA Nemotron", anthropic: "Claude", gemini: "Gemini", ollama: "Ollama (local)" };
 
@@ -66,12 +65,6 @@ function EngineStatus({ session }: { session: AuthSession }) {
         <dt className="text-ink-3">AI engine</dt>
         <dd className={cx("truncate", !data.ai_ready && "text-warn-ink")}>{data.ai_ready ? PROVIDER_NAMES[data.provider] : "Key missing"}</dd>
       </div>
-      {session.stats && (
-        <div className="flex items-center justify-between gap-2 border-t border-line-subtle pt-2">
-          <dt className="text-ink-3">Active users</dt>
-          <dd className="num font-medium text-ink">{session.stats.active_users} / {session.stats.total_users}</dd>
-        </div>
-      )}
     </dl>
   );
 }
@@ -106,7 +99,7 @@ export function Shell({ children }: { children: ReactNode }) {
     return <div role="status" className="grid min-h-dvh place-items-center text-sm text-ink-2"><span className="flex items-center gap-2"><Spinner /> Checking your account</span></div>;
   }
 
-  const navLink = ({ href, label, icon: Icon }: (typeof NAV)[number] | typeof USERS_NAV) => {
+  const navLink = ({ href, label, icon: Icon }: (typeof NAV)[number]) => {
     const active = isActive(pathname, href);
     return (
       <Link
@@ -147,7 +140,6 @@ export function Shell({ children }: { children: ReactNode }) {
           <nav aria-label="Main" className="flex flex-1 flex-col px-2 py-3">
             <div className="flex flex-col gap-1">{MAIN_NAV.map(navLink)}</div>
             <div className="mt-auto flex flex-col gap-1 border-t border-line-subtle pt-2">
-              {session.user.is_admin && navLink(USERS_NAV)}
               {navLink(SETTINGS_NAV)}
             </div>
           </nav>

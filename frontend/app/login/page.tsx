@@ -49,9 +49,9 @@ function LoginContent() {
                 </button>
               )}
               {!status.data?.configured && !status.loading && (
-                <p className="text-sm leading-6 text-ink-2">Google sign-in is not configured. Add the Google Web application client values to backend/.env.</p>
+                <p className="text-sm leading-6 text-ink-2">Google sign-in is not configured. The server owner must add the Google Web application client values.</p>
               )}
-              <p className="text-xs leading-5 text-ink-3">The first Google account to sign in becomes the administrator.</p>
+              <p className="text-xs leading-5 text-ink-3">Your videos, clips and keys are private to your account.</p>
             </div>
           )}
         </section>

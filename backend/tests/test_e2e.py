@@ -128,7 +128,7 @@ def test_api_never_returns_a_key(client):
         for value in secrets:
             assert value not in response.text, f"{path} leaked a secret key"
     status = client.get("/api/settings").json()["secrets"]["NVIDIA_API_KEY"]
-    assert status == {"set": True, "hint": f"…{key[-4:]}"}
+    assert status == {"set": True, "hint": "", "shared": True}, "the shared key is never hinted at"
 
 
 def test_no_key_in_source_files():
@@ -156,16 +156,16 @@ def test_api_rejects_bad_input(client):
     assert client.post("/api/posts", json={"clip_id": "missing"}).status_code == 404
 
 
-def test_accounts_protect_the_app_and_report_active_users(monkeypatch):
+def test_accounts_protect_the_app(monkeypatch):
     from app import auth, youtube
 
     monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
     monkeypatch.setattr(config, "google_login_oauth_client", lambda: {"web": {"client_id": "test"}})
     monkeypatch.setattr(auth, "google_authorization_url",
                         lambda source, redirect: "https://accounts.google.test/authorize")
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM oauth_states")
-    db.execute("DELETE FROM users")
+    db.delete("sessions", {})
+    db.delete("oauth_states", {})
+    db.delete("users", {})
 
     with TestClient(app) as owner, TestClient(app) as member:
         assert owner.get("/api/jobs").status_code == 401
@@ -180,7 +180,7 @@ def test_accounts_protect_the_app_and_report_active_users(monkeypatch):
                             follow_redirects=False)
         assert created.status_code == 303 and created.headers["location"] == "/dashboard/"
         assert "HttpOnly" in created.headers["set-cookie"]
-        assert owner.get("/api/auth/me").json()["user"]["is_admin"] is True
+        assert owner.get("/api/auth/me").json()["user"]["email"] == "owner@example.com"
         assert owner.get("/api/auth/me").status_code == 200
 
         monkeypatch.setattr(auth, "google_claims", lambda source, state, code: {
@@ -190,20 +190,16 @@ def test_accounts_protect_the_app_and_report_active_users(monkeypatch):
         second = member.get("/api/auth/google/callback?state=editor-state&code=editor-code",
                             follow_redirects=False)
         assert second.status_code == 303
-        assert member.get("/api/auth/me").json()["user"]["is_admin"] is False
-        assert member.get("/api/users").status_code == 403
-
-        users = owner.get("/api/users")
-        assert users.status_code == 200
-        assert users.json()["stats"] == {"total_users": 2, "active_users": 2}
-        assert len(users.json()["users"]) == 2
+        me = member.get("/api/auth/me").json()["user"]
+        assert me["email"] == "editor@example.com" and "is_admin" not in me, "everyone is an ordinary user"
+        assert db.count("users") == 2
 
         assert owner.post("/api/auth/logout").status_code == 204
         assert owner.get("/api/auth/me").status_code == 401
 
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM oauth_states")
-    db.execute("DELETE FROM users")
+    db.delete("sessions", {})
+    db.delete("oauth_states", {})
+    db.delete("users", {})
 
 
 def test_google_login_does_not_merge_youtube_permissions():
@@ -229,7 +225,7 @@ def test_google_login_does_not_merge_youtube_permissions():
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile",
     }
-    db.execute("DELETE FROM oauth_states")
+    db.delete("oauth_states", {})
 
 
 def test_job_can_be_queued_and_cancelled(client):
@@ -252,11 +248,11 @@ def test_ai_provider_answers():
 @pytest.mark.network
 def test_full_pipeline_on_a_real_video():
     job_id = "e2e"
-    for old in db.query("SELECT file, thumb FROM clips WHERE job_id = ?", (job_id,)):
+    for old in db.find("clips", {"job_id": job_id}):
         storage.delete(old["file"])
         storage.delete(old["thumb"])
-    db.execute("DELETE FROM clips WHERE job_id = ?", (job_id,))
-    db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    db.delete("clips", {"job_id": job_id})
+    db.delete("jobs", {"id": job_id})
     shutil.rmtree(config.JOBS_DIR / job_id, ignore_errors=True)
     watch = config.DATA / "e2e-clips"
     shutil.rmtree(watch, ignore_errors=True)
@@ -271,9 +267,9 @@ def test_full_pipeline_on_a_real_video():
                        "options": options, "payload": {}, "created_at": time.time(),
                        "updated_at": time.time()})
     started = time.time()
-    runner.process_video(db.one("SELECT * FROM jobs WHERE id = ?", (job_id,)))
-    job = db.one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    clips = db.query("SELECT * FROM clips WHERE job_id = ? ORDER BY start", (job_id,))
+    runner.process_video(db.find_one("jobs", {"id": job_id}))
+    job = db.find_one("jobs", {"id": job_id})
+    clips = db.find("clips", {"job_id": job_id}, sort=[("start", 1)])
     print(f"\n  Source: {job['title']} ({job['channel']}), first {TEST_MINUTES:g} min, "
           f"{time.time() - started:.0f} s total")
     if (job["payload"] or {}).get("warning"):
@@ -281,6 +277,14 @@ def test_full_pipeline_on_a_real_video():
 
     assert clips, "the pipeline produced no clips"
     assert len(clips) <= 2
+    if storage.enabled():  # a processed video leaves nothing on this server
+        assert not (config.JOBS_DIR / job_id).exists(), "the working folder was not cleared"
+        files = job["files"]
+        assert files and files["source"] and files["artifacts"], "the video and its working files were not stored"
+        assert runner.restore_job_files(job_id, source=True).stat().st_size > 100_000, "the stored video is unusable"
+    transcript = runner.job_dir(job_id) / "transcript.json"
+    runner.restore_job_files(job_id)
+    assert transcript.exists()
     for clip in clips:
         assert clip["status"] == "ready", clip["error"]
         if storage.enabled():
@@ -299,8 +303,9 @@ def test_full_pipeline_on_a_real_video():
               f"\"{clip['title']}\"\n    {file}")
         assert (info["width"], info["height"]) == (720, 1280)
         assert 14 <= length <= 46 and abs(info["duration"] - length) < 0.5
-        ass = (config.JOBS_DIR / job_id / "clips" / f"{clip['id']}.ass").read_text(encoding="utf-8")
-        assert ass.count(",Caption,") > 5, "captions were not burned in"
+        spoken = [w for w in json.loads(transcript.read_text(encoding="utf-8"))["words"]
+                  if clip["start"] <= w["s"] <= clip["end"]]
+        assert len(spoken) > 5, "there is no speech in the clip to caption"
         with storage.local_copy(clip["thumb"]) as thumb:
             assert thumb.stat().st_size > 1000
         assert clip["title"] and clip["description"]
@@ -330,8 +335,8 @@ def _ready_clip(tmp_path, clip_id):
     video = config.JOBS_DIR / "posting" / "clips" / f"{clip_id}.mp4"
     video.parent.mkdir(parents=True, exist_ok=True)
     video.write_bytes(b"\x00" * 2048)
-    db.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
-    db.execute("DELETE FROM posts WHERE clip_id = ?", (clip_id,))  # leftovers from earlier runs
+    db.delete("clips", {"id": clip_id})
+    db.delete("posts", {"clip_id": clip_id})  # leftovers from earlier runs
     db.insert("clips", {"id": clip_id, "job_id": "posting", "status": "ready", "start": 0, "end": 30,
                         "title": "Test clip", "description": "A test.", "hashtags": ["clips"],
                         "file": video.relative_to(config.DATA).as_posix(), "options": {"settings": {}},
@@ -343,22 +348,22 @@ def test_upload_sends_the_right_request(tmp_path, monkeypatch):
     from app import youtube
 
     fake = _FakeYouTube()
-    monkeypatch.setattr(youtube, "_service", lambda: fake)
+    monkeypatch.setattr(youtube, "_service", lambda user_id: fake)
     video = _ready_clip(tmp_path, "upl1")
 
-    assert youtube.upload(file=video, title="T" * 150, description="d", tags=["clips"],
+    assert youtube.upload("u1", file=video, title="T" * 150, description="d", tags=["clips"],
                           privacy="public", publish_at=None, category_id="20") == "yt_video_123"
     assert fake.body["status"]["privacyStatus"] == "public"
     assert "publishAt" not in fake.body["status"]
     assert len(fake.body["snippet"]["title"]) == 100 and fake.body["snippet"]["categoryId"] == "20"
 
-    youtube.upload(file=video, title="Later", description="d", tags=[], privacy="public",
+    youtube.upload("u1", file=video, title="Later", description="d", tags=[], privacy="public",
                    publish_at="2030-01-02T10:00:00+05:45", category_id="20")
     assert fake.body["status"]["privacyStatus"] == "private", "YouTube requires private for scheduling"
     assert fake.body["status"]["publishAt"] == "2030-01-02T04:15:00.000Z", "schedule is sent in UTC"
 
     with pytest.raises(youtube.YouTubeError):
-        youtube.upload(file=tmp_path / "missing.mp4", title="x", description="", tags=[],
+        youtube.upload("u1", file=tmp_path / "missing.mp4", title="x", description="", tags=[],
                        privacy="public", publish_at=None, category_id="20")
 
 
@@ -370,8 +375,8 @@ def test_post_now_and_schedule_through_the_app(client, tmp_path, monkeypatch):
     assert not_connected.status_code == 409 and "Connect your YouTube channel" in not_connected.json()["detail"]
 
     connected = {"client_configured": True, "connected": True, "channel": "Test", "connecting": False, "error": ""}
-    monkeypatch.setattr(youtube, "status", lambda: connected)
-    monkeypatch.setattr(youtube, "_service", lambda: _FakeYouTube())
+    monkeypatch.setattr(youtube, "status", lambda user_id: connected)
+    monkeypatch.setattr(youtube, "_service", lambda user_id: _FakeYouTube())
     past = client.post("/api/posts", json={"clip_id": "upl2", "mode": "schedule", "publish_at": "2020-01-01T00:00:00Z"})
     assert past.status_code == 422 and "future" in past.json()["detail"]
 
@@ -379,19 +384,19 @@ def test_post_now_and_schedule_through_the_app(client, tmp_path, monkeypatch):
                         ({"mode": "schedule", "publish_at": "2031-05-01T12:00:00Z"}, "scheduled")):
         post = client.post("/api/posts", json={"clip_id": "upl2", **body})
         assert post.status_code == 201 and post.json()["status"] == "uploading"
-        job = db.one("SELECT * FROM jobs WHERE kind = 'upload' ORDER BY created_at DESC LIMIT 1")
+        job = db.find("jobs", {"kind": "upload"}, sort=[("created_at", -1)], limit=1)[0]
         assert job["payload"]["post_id"] == post.json()["id"] and job["status"] == "queued"
         worker.execute({**job, "status": "running"})      # what the background worker does
-        saved = db.one("SELECT * FROM posts WHERE id = ?", (post.json()["id"],))
+        saved = db.find_one("posts", {"id": post.json()["id"]})
         assert saved["status"] == final and saved["youtube_id"] == "yt_video_123"
-        assert db.one("SELECT status FROM jobs WHERE id = ?", (job["id"],))["status"] == "done"
+        assert db.find_one("jobs", {"id": job["id"]})["status"] == "done"
     assert len([p for p in client.get("/api/posts").json() if p["clip_id"] == "upl2"]) == 2
 
 
 def test_post_kind_follows_what_youtube_will_do(client, tmp_path, monkeypatch):
     from app import youtube
 
-    monkeypatch.setattr(youtube, "status", lambda: {"connected": True})
+    monkeypatch.setattr(youtube, "status", lambda user_id: {"connected": True})
     _ready_clip(tmp_path, "kind1")
     cases = [  # width, height, seconds, kind asked for, expected HTTP status
         (1080, 1920, 30, None, 201), (1080, 1920, 30, "short", 201), (1080, 1920, 30, "video", 409),
@@ -399,8 +404,7 @@ def test_post_kind_follows_what_youtube_will_do(client, tmp_path, monkeypatch):
         (1080, 1920, 200, "short", 409), (1080, 1920, 200, "video", 201),
     ]
     for width, height, seconds, kind, expected in cases:
-        db.execute("UPDATE clips SET width = ?, height = ?, start = 0, end = ? WHERE id = 'kind1'",
-                   (width, height, seconds))
+        db.update("clips", "kind1", width=width, height=height, start=0, end=seconds)
         body = {"clip_id": "kind1", "mode": "now", "privacy": "private",
                 "description": "Great moment #shorts #funny"}
         if kind:
@@ -421,7 +425,7 @@ def test_hook_suggestions_are_short_clean_and_unique(client, monkeypatch):
     words_file = config.JOBS_DIR / "hooks" / "transcript.json"
     words_file.parent.mkdir(parents=True, exist_ok=True)
     words_file.write_text('{"words": [{"w": "He", "s": 1, "e": 1.2}, {"w": "missed", "s": 1.3, "e": 1.6}]}')
-    db.execute("DELETE FROM clips WHERE id = 'hook1'")
+    db.delete("clips", {"id": "hook1"})
     db.insert("clips", {"id": "hook1", "job_id": "hooks", "status": "ready", "start": 0, "end": 20,
                         "title": "A miss", "options": {"words": words_file.relative_to(config.DATA).as_posix(),
                                                        "settings": {}}, "created_at": time.time()})
@@ -443,22 +447,22 @@ def test_failed_upload_is_reported_clearly(client, tmp_path, monkeypatch):
     from app import worker, youtube
 
     _ready_clip(tmp_path, "upl3")
-    monkeypatch.setattr(youtube, "status", lambda: {"connected": True})
+    monkeypatch.setattr(youtube, "status", lambda user_id: {"connected": True})
 
-    def quota(**_):
+    def quota(*_, **__):
         raise youtube.YouTubeError(youtube._explain(Exception("quotaExceeded")))
 
     monkeypatch.setattr(youtube, "upload", quota)
     post = client.post("/api/posts", json={"clip_id": "upl3"}).json()
-    job = db.one("SELECT * FROM jobs WHERE kind = 'upload' ORDER BY created_at DESC LIMIT 1")
+    job = db.find("jobs", {"kind": "upload"}, sort=[("created_at", -1)], limit=1)[0]
     worker.execute({**job, "status": "running"})
-    saved = db.one("SELECT * FROM posts WHERE id = ?", (post["id"],))
-    assert saved["status"] == "failed" and "daily upload quota" in saved["error"]
-    assert db.one("SELECT status FROM jobs WHERE id = ?", (job["id"],))["status"] == "failed"
+    saved = db.find_one("posts", {"id": post["id"]})
+    assert saved["status"] == "failed" and "daily upload limit" in saved["error"]
+    assert db.find_one("jobs", {"id": job["id"]})["status"] == "failed"
 
 
 def test_youtube_oauth_requires_env_configuration(client, monkeypatch):
-    monkeypatch.setattr(config, "google_oauth_client", lambda: None)
+    monkeypatch.setattr(config, "google_login_oauth_client", lambda: None)
     assert client.post("/api/youtube/connect").status_code == 409
     assert client.post("/api/youtube/client", json={"json_text": "not allowed"}).status_code in (404, 405)
 
@@ -493,7 +497,7 @@ def test_cloud_clips_play_and_download_through_signed_links(client, monkeypatch)
         return "https://signed.example/clip?sig=1"
 
     monkeypatch.setattr(storage, "url", fake_url)
-    db.execute("DELETE FROM clips WHERE id IN ('cloud1', 'local1')")
+    db.delete("clips", {"id": {"$in": ["cloud1", "local1"]}})
     db.insert("clips", {"id": "cloud1", "job_id": "x", "status": "ready", "start": 0, "end": 20,
                         "title": 'My: "best" clip', "file": "s3:clipper/x/clips/cloud1.mp4",
                         "thumb": "s3:clipper/x/clips/cloud1.jpg", "options": {"settings": {}},
@@ -519,7 +523,7 @@ def test_cloud_clips_play_and_download_through_signed_links(client, monkeypatch)
 
 
 def test_rendered_clip_moves_to_the_cloud_or_stays_local_on_failure(tmp_path, monkeypatch):
-    db.execute("DELETE FROM jobs WHERE id = 'st1'")
+    db.delete("jobs", {"id": "st1"})
     db.insert("jobs", {"id": "st1", "kind": "video", "status": "running", "options": {},
                        "payload": {}, "created_at": time.time(), "updated_at": time.time()})
     monkeypatch.setattr(storage, "enabled", lambda: True)
@@ -544,7 +548,7 @@ def test_rendered_clip_moves_to_the_cloud_or_stays_local_on_failure(tmp_path, mo
     out, result = make()
     file_ref, thumb_ref = runner.store_outputs("st1", out, result)
     assert not storage.is_remote(file_ref) and (config.DATA / file_ref).exists(), "kept locally when the upload fails"
-    warning = db.one("SELECT payload FROM jobs WHERE id = 'st1'")["payload"]["storage_warning"]
+    warning = db.find_one("jobs", {"id": "st1"})["payload"]["storage_warning"]
     assert "kept on this PC" in warning and "Could not reach the storage service" in warning
 
 
@@ -621,8 +625,8 @@ def _clipped_video(job_id, tmp_path, seconds=70):
                                                   "duration": seconds, "webpage_url": "https://example.com/v"}))
     (folder / "signals.json").write_text(json.dumps([0.0] * seconds))
     settings = config.deep_merge(config.DEFAULT_SETTINGS, {"ai": {"panel_size": 0}, "format": {"quality": 360}})
-    db.execute("DELETE FROM clips WHERE job_id = ?", (job_id,))
-    db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    db.delete("clips", {"job_id": job_id})
+    db.delete("jobs", {"id": job_id})
     db.insert("jobs", {"id": job_id, "kind": "video", "url": "https://example.com/v", "status": "done",
                        "title": "Long video", "options": settings, "payload": {},
                        "created_at": time.time(), "updated_at": time.time()})
@@ -632,11 +636,11 @@ def _clipped_video(job_id, tmp_path, seconds=70):
 
 
 def test_more_clips_endpoint_rules(client, tmp_path):
-    db.execute("DELETE FROM jobs WHERE kind = 'more'")  # requests left over from earlier runs
+    db.delete("jobs", {"kind": "more"})  # requests left over from earlier runs
     _clipped_video("more1", tmp_path)
     ok = client.post("/api/jobs/more1/more", json={"count": 2})
     assert ok.status_code == 201
-    queued = db.one("SELECT * FROM jobs WHERE id = ?", (ok.json()["id"],))
+    queued = db.find_one("jobs", {"id": ok.json()["id"]})
     assert queued["kind"] == "more" and queued["payload"]["source_job_id"] == "more1" and queued["payload"]["count"] == 2
     again = client.post("/api/jobs/more1/more", json={})
     assert again.status_code == 409 and "already being made" in again.json()["detail"]
@@ -673,20 +677,20 @@ def test_more_clips_skip_used_moments_and_continue_the_numbering(tmp_path, monke
     monkeypatch.setattr(selection, "_ask", lambda *a, **k: [
         pick(12, 28, 95, "Same moment again"), pick(45, 62, 70, "A fresh moment")])
     monkeypatch.setattr(llm, "complete_json", lambda *a, **k: {"ranking": []})
-    db.execute("DELETE FROM jobs WHERE id = 'more3-job'")
+    db.delete("jobs", {"id": "more3-job"})
     db.insert("jobs", {"id": "more3-job", "kind": "more", "status": "running", "title": "Long video",
                        "options": {}, "created_at": time.time(), "updated_at": time.time(),
                        "payload": {"source_job_id": "more3", "count": 3, "label_part": True}})
-    runner.process_more(db.one("SELECT * FROM jobs WHERE id = 'more3-job'"))
+    runner.process_more(db.find_one("jobs", {"id": "more3-job"}))
 
-    clips = db.query("SELECT * FROM clips WHERE job_id = 'more3' ORDER BY created_at")
+    clips = db.find("clips", {"job_id": "more3"}, sort=[("created_at", 1)])
     new = [c for c in clips if c["id"] != "more3-c1"]
     assert len(new) == 1, "the overlapping moment is skipped, only the new one is made"
     assert new[0]["start"] >= 44 and new[0]["status"] == "ready"
     assert not (new[0]["start"] < 30 and new[0]["end"] > 10), "no overlap with the clip that already exists"
     assert new[0]["title"].endswith(" – Part 2"), new[0]["title"]
     assert (config.DATA / new[0]["file"]).exists() and source.exists()
-    assert db.one("SELECT payload FROM jobs WHERE id = 'more3-job'")["payload"]["made"] == 1
+    assert db.find_one("jobs", {"id": "more3-job"})["payload"]["made"] == 1
 
 
 def test_more_clips_without_ai_does_not_repeat_the_first_pass(tmp_path, monkeypatch):
@@ -698,18 +702,18 @@ def test_more_clips_without_ai_does_not_repeat_the_first_pass(tmp_path, monkeypa
         raise llm.LLMError("The AI is unavailable.")
 
     monkeypatch.setattr(selection, "_ask", broken)
-    db.execute("DELETE FROM jobs WHERE id = 'more4-job'")
+    db.delete("jobs", {"id": "more4-job"})
     db.insert("jobs", {"id": "more4-job", "kind": "more", "status": "running", "options": {},
                        "created_at": time.time(), "updated_at": time.time(),
                        "payload": {"source_job_id": "more4", "count": 2}})
     with pytest.raises(RuntimeError, match="AI is unavailable"):
-        runner.process_more(db.one("SELECT * FROM jobs WHERE id = 'more4-job'"))
-    assert len(db.query("SELECT id FROM clips WHERE job_id = 'more4'")) == 1
+        runner.process_more(db.find_one("jobs", {"id": "more4-job"}))
+    assert len(db.find("clips", {"job_id": "more4"})) == 1
 
 
 # ---- disk safety ----------------------------------------------------------------------------
 def test_cancelling_stops_a_running_download(monkeypatch):
-    db.execute("DELETE FROM jobs WHERE id = 'dl1'")
+    db.delete("jobs", {"id": "dl1"})
     db.insert("jobs", {"id": "dl1", "kind": "video", "status": "running", "options": {}, "payload": {},
                        "created_at": time.time(), "updated_at": time.time()})
     updates = []
@@ -732,7 +736,7 @@ def test_cancelling_stops_a_running_download(monkeypatch):
 def test_folders_without_a_job_are_swept_but_recent_ones_are_kept():
     import os as _os
 
-    db.execute("DELETE FROM jobs WHERE id = 'sweep-known'")
+    db.delete("jobs", {"id": "sweep-known"})
     db.insert("jobs", {"id": "sweep-known", "kind": "video", "status": "done", "options": {}, "payload": {},
                        "created_at": time.time(), "updated_at": time.time()})
     for name in ("sweep-known", "sweep-old", "sweep-new"):
@@ -774,12 +778,12 @@ def test_the_source_download_is_deleted_once_more_clips_are_stored(tmp_path, mon
     monkeypatch.setattr(selection, "_ask", lambda *a, **k: [{
         "start": 45, "end": 62, "title": "Fresh", "hook": "h", "description": "d", "hashtags": [], "score": 70, "reason": "r"}])
     monkeypatch.setattr(llm, "complete_json", lambda *a, **k: {"ranking": []})
-    db.execute("DELETE FROM jobs WHERE id = 'more5-job'")
+    db.delete("jobs", {"id": "more5-job"})
     db.insert("jobs", {"id": "more5-job", "kind": "more", "status": "running", "options": {},
                        "created_at": time.time(), "updated_at": time.time(),
                        "payload": {"source_job_id": "more5", "count": 1}})
-    runner.process_more(db.one("SELECT * FROM jobs WHERE id = 'more5-job'"))
-    new = [c for c in db.query("SELECT * FROM clips WHERE job_id = 'more5'") if c["id"] != "more5-c1"]
+    runner.process_more(db.find_one("jobs", {"id": "more5-job"}))
+    new = [c for c in db.find("clips", {"job_id": "more5"}) if c["id"] != "more5-c1"]
     assert len(new) == 1 and new[0]["file"].startswith("s3:"), "the new clip was stored remotely"
     assert not source.exists(), "the downloaded source must not be left on the disk"
 
@@ -794,52 +798,206 @@ def test_ping_route_is_public_and_does_no_work(monkeypatch):
         assert anonymous.get("/api/ping").json() == {"ok": True}, "no state is returned"
 
 
-def test_only_allowed_emails_can_sign_in(monkeypatch):
+# ---- accounts: everyone is an ordinary user -----------------------------------------------------
+def _person(email, sub):
     from app import auth
 
-    def claims(email, sub):
-        return {"sub": sub, "email": email, "email_verified": True, "name": "Someone"}
+    return auth.upsert_google_user({"sub": sub, "email": email, "email_verified": True, "name": email})
 
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-    monkeypatch.setenv("ALLOWED_EMAILS", "Owner@Example.com, friend@example.com")
-    with pytest.raises(auth.AuthError, match="not allowed"):
-        auth.upsert_google_user(claims("stranger@example.com", "s1"))
-    assert db.one("SELECT COUNT(*) AS n FROM users")["n"] == 0, "a refused sign-in creates no account"
-    owner = auth.upsert_google_user(claims("owner@example.com", "s2"))
-    friend = auth.upsert_google_user(claims("friend@example.com", "s3"))
-    assert owner["is_admin"] is True and friend["is_admin"] is False
-    db.execute("DELETE FROM users")
+
+def _browser(person):
+    from app import auth
+
+    visitor = TestClient(app)
+    visitor.cookies.set(auth.SESSION_COOKIE, auth.create_session(person["id"]))
+    return visitor
+
+
+def _wipe_people():
+    for name in ("sessions", "users", "user_keys", "youtube", "oauth_states"):
+        db.delete(name, {})
+    db.delete("kv", {"_id": {"$regex": "^(prefs|youtube-connect):"}})
 
 
 def test_public_address_is_read_from_the_environment(monkeypatch):
-    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com/")
-    assert config.public_url() == "https://clipper.example.com"
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://clipper-abc.onrender.com")
+    assert config.public_url() == "https://clipper-abc.onrender.com"
+    monkeypatch.setenv("PUBLIC_URL", "https://clips.example.com/")
+    assert config.public_url() == "https://clips.example.com", "an explicit PUBLIC_URL (custom domain) wins"
 
-def test_hosted_youtube_connect_uses_a_web_redirect_and_checks_state(monkeypatch, tmp_path):
+
+def test_anyone_can_sign_in_and_nobody_is_an_administrator(monkeypatch):
+    from app import auth
+
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    _wipe_people()
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    first, second = _person("first@example.com", "s1"), _person("second@example.com", "s2")
+    assert "is_admin" not in first and "is_admin" not in second, "there are no roles"
+    assert first["id"] != second["id"]
+    again = _person("first@example.com", "s1")
+    assert again["id"] == first["id"], "signing in again finds the same account"
+    with pytest.raises(auth.AuthError):  # an email cannot be taken over by a different Google account
+        _person("first@example.com", "someone-else")
+    me = _browser(first).get("/api/auth/me").json()
+    assert me["user"]["email"] == "first@example.com" and "stats" not in me
+    assert _browser(first).get("/api/users").status_code in (404, 405), "no page lists the other users"
+    assert TestClient(app).get("/api/jobs").status_code == 401, "everyone must sign in"
+    _wipe_people()
+
+
+def test_people_see_only_their_own_work(monkeypatch):
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    _wipe_people()
+    ann, bob, cat = _person("ann@example.com", "a"), _person("bob@example.com", "b"), _person("cat@example.com", "c")
+    for who, person in (("ann", ann), ("bob", bob)):
+        db.delete("jobs", {"id": f"{who}-job"})
+        db.delete("clips", {"id": f"{who}-clip"})
+        db.insert("jobs", {"id": f"{who}-job", "kind": "video", "status": "done", "title": who,
+                           "options": {}, "payload": {}, "created_at": time.time(), "updated_at": time.time(),
+                           "user_id": person["id"], "files": {"artifacts": {"x": "s3:secret/ref"}}})
+        db.insert("clips", {"id": f"{who}-clip", "job_id": f"{who}-job", "user_id": person["id"],
+                            "status": "ready", "start": 0, "end": 20, "title": who, "options": {},
+                            "created_at": time.time(), "file": "s3:private/key.mp4"})
+    ann_c, bob_c, cat_c = _browser(ann), _browser(bob), _browser(cat)
+
+    assert {j["id"] for j in ann_c.get("/api/jobs").json()} == {"ann-job"}
+    assert {j["id"] for j in bob_c.get("/api/jobs").json()} == {"bob-job"}
+    assert cat_c.get("/api/jobs").json() == [] and cat_c.get("/api/clips").json() == []
+    assert [c["id"] for c in ann_c.get("/api/clips").json()] == ["ann-clip"]
+    for call in (ann_c.get("/api/jobs/bob-job"), ann_c.delete("/api/jobs/bob-job"),
+                 ann_c.post("/api/jobs/bob-job/stop"), ann_c.post("/api/jobs/bob-job/more", json={"count": 1}),
+                 ann_c.get("/api/clips/bob-clip"), ann_c.get("/api/clips/bob-clip/file"),
+                 ann_c.patch("/api/clips/bob-clip", json={"title": "mine now"}),
+                 ann_c.post("/api/clips/bob-clip/hooks"), ann_c.delete("/api/clips/bob-clip"),
+                 ann_c.get("/api/clips/bob-clip/download"), ann_c.post("/api/posts", json={"clip_id": "bob-clip"})):
+        assert call.status_code == 404, "someone else's work looks like it does not exist"
+    assert db.find_one("clips", {"id": "bob-clip"})["title"] == "bob"
+    own = ann_c.get("/api/jobs/ann-job").json()
+    assert "files" not in own and "options" not in own and "user_id" not in own, "internals stay on the server"
+    assert "s3:" not in ann_c.get("/api/clips").text, "storage addresses never reach the browser"
+
+    # Settings are per person, and so is the choice of AI engine.
+    base = bob_c.get("/api/settings").json()["settings"]
+    assert ann_c.put("/api/settings", json={"clip": {"max_sec": 45}, "ai": {"provider": "gemini"}}).status_code == 200
+    mine = ann_c.get("/api/settings").json()["settings"]
+    assert mine["clip"]["max_sec"] == 45 and mine["ai"]["provider"] == "gemini"
+    ann_c.put("/api/settings", json={"clip": {"$where": "1", "unknown": 1}, "evil": {"a": 1}})
+    stored_prefs = db.kv_get(f"prefs:{ann['id']}")
+    assert "$where" not in str(stored_prefs) and "unknown" not in str(stored_prefs) and "evil" not in stored_prefs,         "only real settings are saved"
+    theirs = bob_c.get("/api/settings").json()["settings"]
+    assert theirs["clip"]["max_sec"] == base["clip"]["max_sec"] and theirs["ai"]["provider"] == base["ai"]["provider"]
+    assert "storage" not in mine, "storage is server configuration"
+
+    # A long video is welcome: nothing shortens it. A person may have three in progress at once.
+    made = []
+    for n in range(3):
+        response = ann_c.post("/api/jobs", json={"url": f"https://example.com/watch?v={n}",
+                                                 "options": {"max_minutes": 600}})
+        assert response.status_code == 201, response.text
+        made.append(response.json()["id"])
+    assert db.find_one("jobs", {"id": made[0]})["options"]["max_minutes"] == 600, "no length cap"
+    assert db.find_one("jobs", {"id": made[0]})["user_id"] == ann["id"]
+    assert ann_c.post("/api/jobs", json={"url": "https://example.com/watch?v=9"}).status_code == 429
+    assert bob_c.post("/api/jobs", json={"url": "https://example.com/watch?v=9"}).status_code == 201, \
+        "one person's queue does not block another's"
+
+    for job in db.find("jobs", {"user_id": {"$in": [ann["id"], bob["id"]]}}):
+        db.delete("jobs", {"id": job["id"]})
+    db.delete("clips", {"id": {"$in": ["ann-clip", "bob-clip"]}})
+    _wipe_people()
+
+
+def test_a_hosted_server_refuses_work_it_could_not_store(monkeypatch):
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    _wipe_people()
+    ann = _person("ann@example.com", "a")
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    monkeypatch.setattr(storage, "enabled", lambda: False)
+    response = _browser(ann).post("/api/jobs", json={"url": "https://example.com/watch?v=1"})
+    assert response.status_code == 503 and "store" in response.json()["detail"]
+    _wipe_people()
+
+
+def test_each_person_has_their_own_keys_and_the_nvidia_key_is_shared(monkeypatch):
+    from app import keys
+
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    monkeypatch.setenv("APP_SECRET_KEY", "a-test-secret-for-encrypting-keys")
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-the-shared-platform-key-0001")
+    _wipe_people()
+    ann, bob = _person("ann@example.com", "a"), _person("bob@example.com", "b")
+    ann_c, bob_c = _browser(ann), _browser(bob)
+
+    shared = bob_c.get("/api/settings").json()["secrets"]
+    assert shared["NVIDIA_API_KEY"] == {"set": True, "hint": "", "shared": True}
+    assert shared["ANTHROPIC_API_KEY"]["set"] is False, "other providers need the person's own key"
+
+    saved = ann_c.put("/api/secrets", json={"name": "ANTHROPIC_API_KEY", "value": "sk-ant-ann-own-key-abcd1234"})
+    assert saved.status_code == 200 and "sk-ant-ann-own-key" not in saved.text, "a key is never sent back"
+    assert saved.json()["ANTHROPIC_API_KEY"] == {"set": True, "hint": "…1234", "shared": False}
+    assert bob_c.get("/api/settings").json()["secrets"]["ANTHROPIC_API_KEY"]["set"] is False
+    stored = db.coll("user_keys").find_one({"user_id": ann["id"]})
+    assert "sk-ant-ann-own-key" not in str(stored), "keys are encrypted in the database"
+    assert keys.own(ann["id"], "ANTHROPIC_API_KEY") == "sk-ant-ann-own-key-abcd1234"
+    assert ann_c.put("/api/secrets", json={"name": "GOOGLE_LOGIN_CLIENT_SECRET", "value": "x"}).status_code == 422
+
+    # The AI call uses the right key for the right person.
+    ann_c.put("/api/settings", json={"ai": {"provider": "anthropic"}})
+    with llm.as_user(ann["id"]):
+        assert llm._provider()[0] == "anthropic" and llm._provider()[2] == "sk-ant-ann-own-key-abcd1234"
+    bob_c.put("/api/settings", json={"ai": {"provider": "anthropic"}})
+    with llm.as_user(bob["id"]), pytest.raises(llm.LLMError, match="Add your own"):
+        llm._provider()
+    bob_c.put("/api/settings", json={"ai": {"provider": "nvidia"}})
+    with llm.as_user(bob["id"]):
+        assert llm._provider()[2] == "nvapi-the-shared-platform-key-0001"
+    ann_c.put("/api/secrets", json={"name": "NVIDIA_API_KEY", "value": "nvapi-ann-own-nvidia-key-9999"})
+    ann_c.put("/api/settings", json={"ai": {"provider": "nvidia"}})
+    with llm.as_user(ann["id"]):
+        assert llm._provider()[2] == "nvapi-ann-own-nvidia-key-9999", "their own key beats the shared one"
+
+    assert ann_c.put("/api/secrets", json={"name": "ANTHROPIC_API_KEY", "value": ""}).json()["ANTHROPIC_API_KEY"]["set"] is False
+
+    monkeypatch.delenv("APP_SECRET_KEY")
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    with pytest.raises(keys.KeysError, match="APP_SECRET_KEY"):
+        keys.put(ann["id"], "GEMINI_API_KEY", "g" * 20)
+    _wipe_people()
+
+
+def test_each_person_connects_and_posts_to_their_own_youtube_channel(monkeypatch):
     from google_auth_oauthlib.flow import Flow
 
-    from app import youtube
+    from app import keys, worker, youtube
 
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    monkeypatch.setenv("APP_SECRET_KEY", "a-test-secret-for-encrypting-keys")
     monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
     monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_ID", "web-client.example")
     monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_SECRET", "web-secret-for-test")
-    monkeypatch.setattr(youtube, "TOKEN_FILE", tmp_path / "token.json")
-    db.kv_set("youtube", {})
-    assert youtube.hosted() and youtube.client_configured()
+    _wipe_people()
+    ann, bob = _person("ann@example.com", "a"), _person("bob@example.com", "b")
+    ann_c, bob_c = _browser(ann), _browser(bob)
 
-    url = youtube.start_web_connect()
-    assert "redirect_uri=https%3A%2F%2Fclipper.example.com%2Fapi%2Fyoutube%2Fcallback" in url
-    assert "code_challenge=" in url and "access_type=offline" in url
-    state = db.kv_get("youtube")["state"]
-    assert youtube.status()["connecting"] is True and youtube.status()["auth_url"] == url
+    assert ann_c.get("/api/youtube").json()["connected"] is False
+    start = ann_c.post("/api/youtube/connect")
+    assert start.status_code == 202
+    url = start.json()["redirect_to"]
+    assert "redirect_uri=https%3A%2F%2Fclipper.example.com%2Fapi%2Fyoutube%2Fcallback" in url and "code_challenge=" in url
+    state = db.kv_get(f"youtube-connect:{ann['id']}")["state"]
+    assert ann_c.get("/api/youtube").json()["connecting"] is True
+    assert bob_c.get("/api/youtube").json()["connecting"] is False, "one person's sign-in is not another's"
 
-    with pytest.raises(youtube.YouTubeError, match="expired"):
-        youtube.finish_web_connect("some-other-state", "code")
+    # Another person cannot finish ann's sign-in, and a wrong state is refused.
+    refused = bob_c.get(f"/api/youtube/callback?code=x&state={state}", follow_redirects=False)
+    assert refused.status_code == 303 and keys.load_youtube(bob["id"]) is None
+    assert "expired" in bob_c.get("/api/youtube").json()["error"]
 
     class Credentials:
         def to_json(self):
-            return '{"token": "t"}'
+            return '{"token": "ann-secret-token", "refresh_token": "r"}'
 
     seen = {}
 
@@ -848,160 +1006,78 @@ def test_hosted_youtube_connect_uses_a_web_redirect_and_checks_state(monkeypatch
 
     monkeypatch.setattr(Flow, "fetch_token", fake_fetch)
     monkeypatch.setattr(Flow, "credentials", property(lambda self: Credentials()))
-    monkeypatch.setattr(youtube, "_service", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
-    youtube.finish_web_connect(state, "the-code")
+    monkeypatch.setattr(youtube, "_service", lambda user_id: (_ for _ in ()).throw(RuntimeError("offline")))
+    done = ann_c.get(f"/api/youtube/callback?code=the-code&state={state}", follow_redirects=False)
+    assert done.status_code == 303 and done.headers["location"] == "/settings/#youtube"
     assert seen["code"] == "the-code" and seen["verifier"], "the code is exchanged with the stored PKCE verifier"
-    assert (tmp_path / "token.json").exists() and youtube.status()["connected"] is True
-    assert youtube.status()["connecting"] is False
-    db.kv_set("youtube", {})
+    assert ann_c.get("/api/youtube").json()["connected"] is True
+    assert bob_c.get("/api/youtube").json()["connected"] is False
+    assert "ann-secret-token" not in str(db.coll("youtube").find_one({"user_id": ann["id"]})), "token is encrypted"
+    assert "ann-secret-token" not in ann_c.get("/api/youtube").text
+
+    # Posting uses the poster's own channel; someone with none connected cannot post.
+    db.delete("clips", {"id": "yt-clip"})
+    db.insert("clips", {"id": "yt-clip", "job_id": "x", "user_id": ann["id"], "status": "ready", "start": 0,
+                        "end": 30, "width": 1080, "height": 1920, "title": "T", "options": {"settings": {}},
+                        "created_at": time.time(), "file": "jobs/x/clip.mp4"})
+    db.insert("clips", {"id": "yt-clip-bob", "job_id": "y", "user_id": bob["id"], "status": "ready", "start": 0,
+                        "end": 30, "width": 1080, "height": 1920, "title": "T", "options": {"settings": {}},
+                        "created_at": time.time()})
+    assert bob_c.post("/api/posts", json={"clip_id": "yt-clip-bob"}).status_code == 409, "bob has no channel"
+    assert bob_c.post("/api/posts", json={"clip_id": "yt-clip"}).status_code == 404, "and cannot use ann's clip"
+    post = ann_c.post("/api/posts", json={"clip_id": "yt-clip", "mode": "now"})
+    assert post.status_code == 201 and "user_id" not in post.json()
+    used = {}
+
+    def fake_upload(user_id, **kwargs):
+        used["user"] = user_id
+        return "yt123"
+
+    monkeypatch.setattr(youtube, "upload", fake_upload)
+    monkeypatch.setattr(storage, "local_copy", lambda ref: __import__("contextlib").nullcontext(Path("clip.mp4")))
+    job = db.find("jobs", {"kind": "upload"}, sort=[("created_at", -1)], limit=1)[0]
+    assert job["user_id"] == ann["id"]
+    worker.execute({**job, "status": "running"})
+    assert used["user"] == ann["id"], "the upload goes to the channel of the person who posted"
+    assert [p["id"] for p in ann_c.get("/api/posts").json()] == [post.json()["id"]]
+    assert bob_c.get("/api/posts").json() == []
+
+    disconnected = ann_c.post("/api/youtube/disconnect").json()
+    assert disconnected["connected"] is False and keys.load_youtube(ann["id"]) is None
+    for doc in ("yt-clip", "yt-clip-bob"):
+        db.delete("clips", {"id": doc})
+    db.delete("posts", {"clip_id": "yt-clip"})
+    _wipe_people()
 
 
-def test_hosted_routes_use_the_public_address_and_only_the_owner_can_change_youtube(monkeypatch):
-    from app import auth
+def test_working_files_and_the_source_video_are_kept_in_storage_not_on_the_server(tmp_path, monkeypatch):
+    bucket = {}
+    monkeypatch.setattr(storage, "enabled", lambda: True)
+    monkeypatch.setattr(storage, "key_for", lambda job, name: f"t/{job}/{name}")
+    monkeypatch.setattr(storage, "put", lambda path, key, ctype: bucket.setdefault(key, Path(path).read_bytes()) and "s3:" + key)
+    monkeypatch.setattr(storage, "get", lambda ref, dest: (dest.parent.mkdir(parents=True, exist_ok=True),
+                                                           dest.write_bytes(bucket[ref.removeprefix("s3:")]), dest)[2])
+    deleted = []
+    monkeypatch.setattr(storage, "delete", lambda ref: deleted.append(ref))
 
-    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
-    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
-    monkeypatch.setenv("ALLOWED_EMAILS", "owner@example.com,friend@example.com")
-    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_ID", "web-client.example")
-    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_SECRET", "web-secret-for-test")
-    asked = {}
-    monkeypatch.setattr(auth, "google_authorization_url",
-                        lambda source, redirect: asked.setdefault("redirect", redirect) and "https://accounts.google.test/x")
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-    owner = auth.upsert_google_user({"sub": "o1", "email": "owner@example.com", "email_verified": True})
-    friend = auth.upsert_google_user({"sub": "f1", "email": "friend@example.com", "email_verified": True})
-    db.kv_set("youtube", {})
+    db.delete("jobs", {"id": "keep1"})
+    db.insert("jobs", {"id": "keep1", "kind": "video", "status": "done", "options": {}, "payload": {},
+                       "created_at": time.time(), "updated_at": time.time(), "user_id": "u"})
+    folder = runner.job_dir("keep1")
+    for name in ("meta.json", "transcript.json", "signals.json"):
+        (folder / name).write_text('{"name": "%s"}' % name)
+    source = folder / "source.mp4"
+    source.write_bytes(b"\x01" * 5000)
 
-    with TestClient(app) as browser:
-        browser.get("/api/auth/google", follow_redirects=False)
-        assert asked["redirect"] == "https://clipper.example.com/api/auth/google/callback", \
-            "behind a hosting proxy the sign-in must return to the public address"
+    runner.persist_job_files("keep1", folder, source)
+    assert not folder.exists(), "nothing is left on the server after a video is processed"
+    files = db.find_one("jobs", {"id": "keep1"})["files"]
+    assert set(files["artifacts"]) == {"meta.json", "transcript.json", "signals.json"} and files["source"]
 
-        browser.cookies.set(auth.SESSION_COOKIE, auth.create_session(friend["id"]))
-        assert browser.post("/api/youtube/connect").status_code == 403
-        assert browser.post("/api/youtube/disconnect").status_code == 403
-        assert browser.get("/api/youtube/callback?code=x&state=y", follow_redirects=False).status_code == 403
-
-        browser.cookies.set(auth.SESSION_COOKIE, auth.create_session(owner["id"]))
-        cancelled = browser.get("/api/youtube/callback?error=access_denied", follow_redirects=False)
-        assert cancelled.status_code == 303 and cancelled.headers["location"] == "/settings/#youtube"
-        assert "cancelled" in browser.get("/api/youtube").json()["error"]
-        started = browser.post("/api/youtube/connect")
-        assert started.status_code == 202 and started.json()["redirect_to"].startswith("https://accounts.google.com/")
-    db.kv_set("youtube", {})
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-
-
-def test_render_supplies_the_public_address_itself(monkeypatch):
-    monkeypatch.delenv("PUBLIC_URL", raising=False)
-    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://clipper-abc.onrender.com")
-    assert config.public_url() == "https://clipper-abc.onrender.com"
-    monkeypatch.setenv("PUBLIC_URL", "https://clips.example.com/")
-    assert config.public_url() == "https://clips.example.com", "an explicit PUBLIC_URL (custom domain) wins"
-
-
-def _person(email, sub):
-    from app import auth
-
-    return auth.upsert_google_user({"sub": sub, "email": email, "email_verified": True, "name": email})
-
-
-def test_anyone_can_sign_in_and_only_the_named_owner_is_administrator(monkeypatch):
-    from app import auth
-
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
-    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
-    monkeypatch.setenv("ADMIN_EMAILS", "Owner@Example.com")
-    stranger = _person("stranger@example.com", "s1")  # arrives first
-    owner = _person("owner@example.com", "s2")
-    assert stranger["is_admin"] is False, "a stranger who arrives first must not become the owner"
-    assert owner["is_admin"] is True
-
-    monkeypatch.setenv("ALLOWED_EMAILS", "owner@example.com")  # an optional list still works
-    with pytest.raises(auth.AuthError, match="not allowed"):
-        _person("someone@example.com", "s3")
-
-    monkeypatch.delenv("ALLOWED_EMAILS")
-    monkeypatch.delenv("ADMIN_EMAILS")
-    db.execute("DELETE FROM users")
-    assert _person("first@example.com", "s4")["is_admin"] is True, "with no owner named the first account is"
-    assert _person("second@example.com", "s5")["is_admin"] is False
-    db.execute("DELETE FROM users")
-
-
-def test_people_see_only_their_own_work_and_cannot_touch_the_owners_things(monkeypatch):
-    from app import auth
-
-    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
-    monkeypatch.setenv("ADMIN_EMAILS", "owner@example.com")
-    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-    owner, ann, bob = (_person("owner@example.com", "o"), _person("ann@example.com", "a"),
-                       _person("bob@example.com", "b"))
-    for who, person in (("ann", ann), ("bob", bob)):
-        db.execute("DELETE FROM jobs WHERE id = ?", (f"{who}-job",))
-        db.execute("DELETE FROM clips WHERE id = ?", (f"{who}-clip",))
-        db.insert("jobs", {"id": f"{who}-job", "kind": "video", "status": "done", "title": who,
-                           "options": {}, "payload": {}, "created_at": time.time(), "updated_at": time.time(),
-                           "user_id": person["id"]})
-        db.insert("clips", {"id": f"{who}-clip", "job_id": f"{who}-job", "status": "ready", "start": 0, "end": 20,
-                            "title": who, "options": {}, "created_at": time.time()})
-
-    def browser(person):
-        client_for = TestClient(app)
-        client_for.cookies.set(auth.SESSION_COOKIE, auth.create_session(person["id"]))
-        return client_for
-
-    owner_c, ann_c, bob_c = browser(owner), browser(ann), browser(bob)
-
-    # Work belongs to the person who made it.
-    assert {j["id"] for j in ann_c.get("/api/jobs").json()} == {"ann-job"}
-    assert {j["id"] for j in owner_c.get("/api/jobs").json()} >= {"ann-job", "bob-job"}, "the owner sees all"
-    assert [c["id"] for c in ann_c.get("/api/clips").json()] == ["ann-clip"]
-    for call in (ann_c.get("/api/jobs/bob-job"), ann_c.delete("/api/jobs/bob-job"),
-                 ann_c.post("/api/jobs/bob-job/stop"), ann_c.get("/api/clips/bob-clip"),
-                 ann_c.patch("/api/clips/bob-clip", json={"title": "mine now"}),
-                 ann_c.delete("/api/clips/bob-clip"), ann_c.get("/api/clips/bob-clip/download")):
-        assert call.status_code == 404, "someone else's work looks like it does not exist"
-    assert db.one("SELECT title FROM clips WHERE id = 'bob-clip'")["title"] == "bob"
-
-    # The owner's keys, engine, storage and YouTube channel stay the owner's.
-    assert ann_c.put("/api/secrets", json={"name": "NVIDIA_API_KEY", "value": "x" * 20}).status_code == 403
-    assert ann_c.post("/api/posts", json={"clip_id": "ann-clip"}).status_code == 403
-    assert ann_c.post("/api/storage/test").status_code == 403
-    assert ann_c.post("/api/ai/test").status_code == 403
-    assert ann_c.get("/api/posts").json() == []
-    assert all(item["hint"] == "" for item in ann_c.get("/api/settings").json()["secrets"].values())
-
-    # Clip, format and caption choices are per person; the AI engine is not theirs to change.
-    provider = owner_c.get("/api/settings").json()["settings"]["ai"]["provider"]
-    shared_max = owner_c.get("/api/settings").json()["settings"]["clip"]["max_sec"]
-    assert ann_c.put("/api/settings", json={"clip": {"max_sec": 45}, "ai": {"provider": "gemini"}}).status_code == 200
-    assert ann_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == 45
-    assert bob_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == shared_max
-    assert owner_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == shared_max
-    assert owner_c.get("/api/settings").json()["settings"]["ai"]["provider"] == provider
-
-    # A guest may have two videos in progress; the owner has no limit.
-    made = []
-    for n in range(2):
-        response = ann_c.post("/api/jobs", json={"url": f"https://example.com/watch?v={n}"})
-        assert response.status_code == 201, response.text
-        made.append(response.json()["id"])
-    assert ann_c.post("/api/jobs", json={"url": "https://example.com/watch?v=9"}).status_code == 429
-    again = owner_c.post("/api/jobs", json={"url": "https://example.com/watch?v=10"})
-    assert again.status_code == 201
-    made.append(again.json()["id"])
-    assert db.one("SELECT user_id FROM jobs WHERE id = ?", (made[0],))["user_id"] == ann["id"]
-
-    for job_id in made + ["ann-job", "bob-job"]:
-        db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    db.execute("DELETE FROM clips WHERE id IN ('ann-clip', 'bob-clip')")
-    db.execute("DELETE FROM kv WHERE key LIKE 'prefs:%'")
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
+    got = runner.restore_job_files("keep1", source=True)
+    assert got.read_bytes() == b"\x01" * 5000, "the downloaded video comes back from storage when needed"
+    assert (runner.job_dir("keep1") / "transcript.json").read_text() == '{"name": "transcript.json"}'
+    runner.delete_job_files("keep1", files)
+    assert not (config.JOBS_DIR / "keep1").exists()
+    assert set(deleted) == {*files["artifacts"].values(), files["source"]}, "deleting a video deletes its stored files"
+    db.delete("jobs", {"id": "keep1"})

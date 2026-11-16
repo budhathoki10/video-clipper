@@ -1,18 +1,35 @@
 """One interface over the supported AI providers.
 
-`complete()` returns text, `complete_json()` returns parsed JSON. The provider
-and model come from settings; keys come from backend/.env via config.secret().
+`complete()` returns text, `complete_json()` returns parsed JSON. The provider and model are the
+signed-in person's own choice. Their own key is used if they saved one; otherwise NVIDIA falls back
+to the key the server provides for everyone. Other providers need the person's own key.
+
+Work runs on behalf of one person (`as_user`), so a job always uses that person's settings and keys.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
-from . import config, db
+from . import config, db, keys
+
+_user: contextvars.ContextVar[str | None] = contextvars.ContextVar("llm_user", default=None)
+
+
+@contextlib.contextmanager
+def as_user(user_id: str | None) -> Iterator[None]:
+    """Run AI calls for this person: their provider, model and keys."""
+    token = _user.set(user_id)
+    try:
+        yield
+    finally:
+        _user.reset(token)
 
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -27,14 +44,18 @@ class LLMError(RuntimeError):
 
 
 def _provider() -> tuple[str, str, str]:
-    ai = db.get_settings()["ai"]
+    user = _user.get()
+    ai = db.settings_for(user)["ai"]
     provider = ai["provider"]
     if provider not in config.PROVIDER_SECRET:
         raise LLMError(f"Unknown AI provider '{provider}'. Pick one in Settings.")
     secret_name = config.PROVIDER_SECRET[provider]
-    key = config.secret(secret_name) if secret_name else ""
+    try:
+        key = keys.effective(user, secret_name) if secret_name else ""
+    except keys.KeysError as exc:
+        raise LLMError(str(exc)) from None
     if secret_name and not key:
-        raise LLMError(f"No API key set for {provider}. Add one in Settings → AI engine.")
+        raise LLMError(f"No API key set for {provider}. Add your own in Settings → AI engine.")
     return provider, ai["models"][provider], key
 
 

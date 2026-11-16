@@ -19,10 +19,10 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 const PROVIDERS: { id: Provider; name: string; secret: string | null; note: string }[] = [
-  { id: "nvidia", name: "NVIDIA Nemotron Ultra", secret: "NVIDIA_API_KEY", note: "Default. Hosted by NVIDIA." },
-  { id: "anthropic", name: "Claude", secret: "ANTHROPIC_API_KEY", note: "Anthropic API." },
-  { id: "gemini", name: "Gemini", secret: "GEMINI_API_KEY", note: "Google AI Studio key." },
-  { id: "ollama", name: "Ollama (local)", secret: null, note: "Runs on this PC. No key, lower quality." },
+  { id: "nvidia", name: "NVIDIA Nemotron Ultra", secret: "NVIDIA_API_KEY", note: "Default. A shared key is included for everyone." },
+  { id: "anthropic", name: "Claude", secret: "ANTHROPIC_API_KEY", note: "Needs your own Anthropic key." },
+  { id: "gemini", name: "Gemini", secret: "GEMINI_API_KEY", note: "Needs your own Google AI Studio key." },
+  { id: "ollama", name: "Ollama (local)", secret: null, note: "Runs on the same computer as Clipper. No key, lower quality." },
 ];
 const FONTS = ["Poppins ExtraBold", "Anton", "Bangers", "Arial Black", "Impact"];
 const QUALITIES = [[720, "720p"], [1080, "1080p"], [1440, "1440p"], [2160, "4K"]] as const;
@@ -41,7 +41,7 @@ function Row({ children }: { children: ReactNode }) {
   return <div className="border-t border-line-subtle pt-4 first:border-t-0 first:pt-0">{children}</div>;
 }
 
-function ApiKey({ secret, status, onSaved, label = "API key" }: { secret: string; status?: { set: boolean; hint: string }; onSaved: (s: SecretStatus) => void; label?: string }) {
+function ApiKey({ secret, status, onSaved, label = "API key" }: { secret: string; status?: { set: boolean; hint: string; shared?: boolean }; onSaved: (s: SecretStatus) => void; label?: string }) {
   const toast = useToast();
   const [value, setValue] = useState("");
   const [saving, setSaving] = useState(false);
@@ -65,7 +65,13 @@ function ApiKey({ secret, status, onSaved, label = "API key" }: { secret: string
     <Field
       label={label}
       error={error}
-      hint={status?.set ? `A key ending in ${status.hint.replace("…", "")} is saved. It is never shown again.` : "No key saved yet. It is stored securely and never shown again."}
+      hint={
+        status?.shared
+          ? "A shared key is included, so this works now. Add your own to use your own quota."
+          : status?.set
+            ? `Your key${status.hint ? ` ending in ${status.hint.replace("…", "")}` : ""} is saved. It is encrypted and never shown again.`
+            : "No key saved yet. Add your own: it is encrypted and only used for your clips."
+      }
     >
       {(p) => (
         <div className="flex gap-2">
@@ -84,7 +90,6 @@ function YouTubeConnect() {
   const yt = useApi<YouTubeStatus>("/api/youtube", 2500);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [setupOpen, setSetupOpen] = useState(false);
   const status = yt.data;
 
   async function run(name: string, path: string, body?: unknown, done?: string) {
@@ -133,8 +138,7 @@ function YouTubeConnect() {
           loading={waiting}
           onClick={async () => {
             if (!status.client_configured) {
-              setSetupOpen(true);
-              setError("Google OAuth is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to backend/.env, then restart Clipper.");
+              setError("Posting to YouTube is not set up on this server yet. Ask whoever runs Clipper to finish the Google setup.");
               return;
             }
             await run("connect", "/api/youtube/connect");
@@ -142,7 +146,7 @@ function YouTubeConnect() {
         >
           {!waiting && <YouTubeMark />} {waiting ? "Waiting for Google sign-in" : "Connect YouTube"}
         </Button>
-        <p className="text-xs text-ink-3">Opens Google in your browser. Choose your channel and allow uploads.</p>
+        <p className="text-xs text-ink-3">Opens Google. Choose your own channel and allow uploads. Clips you post go to that channel.</p>
       </div>
       {waiting && (
         <div className="flex flex-col gap-2 text-sm text-ink-2">
@@ -167,31 +171,7 @@ function YouTubeConnect() {
       )}
       {(error || status.error) && !waiting && <p role="alert" className="text-sm text-bad-ink">{error || status.error}</p>}
 
-      <div className="rounded-md border border-line-subtle">
-        <button type="button" aria-expanded={setupOpen} aria-controls="yt-setup" onClick={() => setSetupOpen((v) => !v)} className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm text-ink-2 hover:text-ink">
-          <span>
-            One-time setup for the app owner{" "}
-            {status.client_configured && <span className="text-ok-ink">· done</span>}
-          </span>
-          <ChevronDown aria-hidden className={cx("size-4 transition-transform duration-150", setupOpen && "rotate-180")} />
-        </button>
-        {setupOpen && (
-          <div id="yt-setup" className="animate-enter flex flex-col gap-3 border-t border-line-subtle p-3">
-            <p className="text-sm text-ink-2">
-              Google requires every app that uploads to YouTube to be registered once. Whoever runs this copy of Clipper does this a single time; everyone using it afterwards only presses Connect YouTube.
-            </p>
-            <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-ink-2">
-              <li>In console.cloud.google.com, enable “YouTube Data API v3” for a project.</li>
-              <li>Under Google Auth Platform → Audience, add the channel&apos;s Google account as a test user.</li>
-              <li>Under Clients, create a client of type “Desktop app”.</li>
-              <li>Copy its client ID and client secret into GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env.</li>
-              <li>Restart Clipper, then press Connect YouTube.</li>
-            </ol>
-            <p className="text-xs leading-5 text-ink-3">For security, these values are read only from backend/.env and are never returned by the API.</p>
-            <Notice>Until Google has audited the project, videos uploaded by the app stay private and daily uploads are limited. You can make them public in YouTube Studio.</Notice>
-          </div>
-        )}
-      </div>
+      <Notice>Until Google has verified this app, videos you upload stay private and daily uploads are limited. You can make them public in YouTube Studio.</Notice>
     </div>
   );
 }
@@ -425,7 +405,7 @@ export default function SettingsPage() {
                     <Field label="Audience panel size" hint="Simulated viewers per clip, up to 100. 0 turns the panel off.">
                       {(p) => <input {...p} type="number" min={0} max={100} step={5} className="field num" value={form.ai.panel_size} onChange={(e) => set("ai", "panel_size", Math.min(num(e.target.value, 100), 100))} />}
                     </Field>
-                    <Field label="Speech model" hint="Runs on this PC's graphics card.">
+                    <Field label="Speech model" hint="Runs on the server that makes your clips.">
                       {(p) => (
                         <select {...p} className="field" value={form.ai.whisper_model} onChange={(e) => set("ai", "whisper_model", e.target.value)}>
                           <option value="large-v3-turbo">Accurate (large-v3-turbo)</option>

@@ -87,15 +87,15 @@ def notify(title: str, body: str) -> subprocess.Popen | None:
 
 
 def run_upload(job: dict[str, Any]) -> None:
-    post = db.one("SELECT * FROM posts WHERE id = ?", (job["payload"]["post_id"],))
-    clip = db.one("SELECT * FROM clips WHERE id = ?", (post["clip_id"],)) if post else None
+    post = db.find_one("posts", {"id": job["payload"]["post_id"]})
+    clip = db.find_one("clips", {"id": post["clip_id"]}) if post else None
     if not post or not clip:
         raise RuntimeError("The clip for this post was deleted.")
     category = youtube.CATEGORY_IDS.get((clip["options"] or {}).get("category", ""), "24")
     try:
         with storage.local_copy(clip["file"]) as video:
             video_id = youtube.upload(
-                file=video, title=post["title"], description=post["description"],
+                post["user_id"], file=video, title=post["title"], description=post["description"],
                 tags=clip["hashtags"] or [], privacy=post["privacy"], publish_at=post["publish_at"],
                 category_id=category,
                 on_progress=lambda p: runner.set_step(job["id"], "Uploading to YouTube", p),
@@ -108,12 +108,6 @@ def run_upload(job: dict[str, Any]) -> None:
     runner.set_step(job["id"], "Uploaded", 1.0)
 
 
-def run_migrate(job: dict[str, Any]) -> None:
-    runner.set_step(job["id"], "Moving clips to storage", 0.02)
-    result = storage.migrate_local_clips(lambda p: runner.set_step(job["id"], "Moving clips to storage", p))
-    runner.set_step(job["id"], f"Moved {result['moved']} clips, freed {result['freed_mb']} MB of sources", 1.0)
-
-
 def run_trends(job: dict[str, Any]) -> None:
     runner.set_step(job["id"], "Reading YouTube trends", 0.3)
     trends.refresh()
@@ -122,10 +116,16 @@ def run_trends(job: dict[str, Any]) -> None:
 
 HANDLERS = {"video": runner.process_video, "more": runner.process_more, "live": live.run_live,
             "render": runner.rerender,
-            "upload": run_upload, "trends": run_trends, "migrate": run_migrate}
+            "upload": run_upload, "trends": run_trends}
 
 
 def execute(job: dict[str, Any]) -> None:
+    """Run one job on behalf of the person who made it (their AI choice and keys)."""
+    with llm.as_user(job.get("user_id")):
+        _execute(job)
+
+
+def _execute(job: dict[str, Any]) -> None:
     job_id = job["id"]
     try:
         if job["kind"] == "auto":
@@ -135,18 +135,17 @@ def execute(job: dict[str, Any]) -> None:
         HANDLERS[job["kind"]](job)
         db.update("jobs", job_id, status="done", error=None)
         if job["kind"] in ("video", "live"):
-            count = db.one("SELECT COUNT(*) AS n FROM clips WHERE job_id = ? AND status = 'ready'",
-                           (job_id,))["n"]
-            fresh = db.one("SELECT title FROM jobs WHERE id = ?", (job_id,))
+            count = db.count("clips", {"job_id": job_id, "status": "ready"})
+            fresh = db.find_one("jobs", {"id": job_id})
             notify(f"{count} clips ready", (fresh or {}).get("title") or "Your video is finished.")
         elif job["kind"] == "more":
-            fresh = db.one("SELECT title, payload FROM jobs WHERE id = ?", (job_id,)) or {}
+            fresh = db.find_one("jobs", {"id": job_id}) or {}
             made = int((fresh.get("payload") or {}).get("made") or 0)
             notify(f"{made} more clips ready" if made else "No more strong moments found",
                    fresh.get("title") or "Your video")
     except runner.Cancelled:
         runner.cleanup_partial((job.get("payload") or {}).get("source_job_id") or job_id)
-        row = db.one("SELECT status FROM jobs WHERE id = ?", (job_id,))
+        row = db.find_one("jobs", {"id": job_id})
         if row and row["status"] == "stopping":
             db.update("jobs", job_id, status="done")
     except (media.MediaError, llm.LLMError, youtube.YouTubeError, storage.StorageError,
@@ -159,15 +158,14 @@ def execute(job: dict[str, Any]) -> None:
 
 
 def claim(job_id: str) -> bool:
-    return db.execute("UPDATE jobs SET status = 'running', updated_at = ? "
-                      "WHERE id = ? AND status = 'queued'", (time.time(), job_id)) == 1
+    return db.claim_job(job_id)
 
 
 def dispatch() -> None:
-    for job in db.query("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at"):
+    for job in db.find("jobs", {"status": "queued"}, sort=[("created_at", 1)]):
         if job["kind"] in ("video", "more"):  # both use the graphics card and the disk heavily
-            busy = db.one("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running' AND kind IN ('video', 'more')")
-            if busy["n"] or not claim(job["id"]):
+            if db.count("jobs", {"status": "running", "kind": {"$in": ["video", "more"]}}) \
+                    or not claim(job["id"]):
                 continue
             heavy.submit(execute, job)
         elif job["kind"] == "live":
@@ -179,16 +177,19 @@ def dispatch() -> None:
 
 
 def refresh_views() -> None:
-    posts = db.query("SELECT id, youtube_id FROM posts WHERE youtube_id IS NOT NULL")
-    if not posts or not youtube.TOKEN_FILE.exists():
-        return
-    try:
-        counts = youtube.view_counts([p["youtube_id"] for p in posts])
-    except Exception:
-        return
-    for post in posts:
-        if post["youtube_id"] in counts:
-            db.update("posts", post["id"], views=counts[post["youtube_id"]])
+    """Update view counts, one person's channel at a time (each post is on its owner's channel)."""
+    by_person: dict[str, list[dict[str, Any]]] = {}
+    for post in db.find("posts", {"youtube_id": {"$ne": None}}, fields=["id", "youtube_id", "user_id"]):
+        if post.get("user_id"):
+            by_person.setdefault(post["user_id"], []).append(post)
+    for user_id, posts in by_person.items():
+        try:
+            counts = youtube.view_counts(user_id, [p["youtube_id"] for p in posts])
+        except Exception:
+            continue  # this person's channel is not connected or its sign-in expired
+        for post in posts:
+            if post["youtube_id"] in counts:
+                db.update("posts", post["id"], views=counts[post["youtube_id"]])
 
 
 def main() -> None:
@@ -197,14 +198,8 @@ def main() -> None:
         print("A worker is already running.")
         return
     # Anything left "running" belonged to a worker that stopped: resume it.
-    db.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
-    db.execute("UPDATE jobs SET status = 'done' WHERE status = 'stopping'")
-    if storage.enabled() and storage.local_clip_count():
-        queued = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'migrate' AND status IN ('queued','running')")
-        if not queued["n"]:
-            db.insert("jobs", {"id": db.new_id(), "kind": "migrate", "status": "queued", "step": "Queued",
-                               "progress": 0, "title": "Move clips to storage", "options": {}, "payload": {},
-                               "created_at": time.time(), "updated_at": time.time()})
+    db.update_where("jobs", {"status": "running"}, {"status": "queued"})
+    db.update_where("jobs", {"status": "stopping"}, {"status": "done"})
     print(f"Worker started (pid {os.getpid()}). Data folder: {config.DATA}")
     last_views = 0.0
     last_sweep = 0.0
@@ -212,7 +207,7 @@ def main() -> None:
         try:
             db.kv_set(HEARTBEAT_KEY, {"at": time.time(), "pid": os.getpid()})
             dispatch()
-            running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('running','queued')")["n"]
+            running = db.count("jobs", {"status": {"$in": ["running", "queued"]}})
             keep_awake(running > 0)
             if time.time() - last_sweep > 3600:  # at start, then hourly
                 last_sweep = time.time()

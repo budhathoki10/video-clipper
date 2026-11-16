@@ -2,7 +2,7 @@
 
 Google's stable ``sub`` claim identifies an account. Session tokens are sent
 only in an HttpOnly cookie; the database stores a SHA-256 digest, never the
-token itself.
+token itself. Everyone who signs in is an ordinary user with a private workspace.
 """
 from __future__ import annotations
 
@@ -12,11 +12,12 @@ import secrets
 import time
 from typing import Any
 
-from . import config, db
+from pymongo.errors import DuplicateKeyError
+
+from . import db
 
 SESSION_COOKIE = "clipper_session"
 SESSION_DAYS = 30
-ACTIVE_SECONDS = 15 * 60
 OAUTH_STATE_SECONDS = 10 * 60
 GOOGLE_SCOPES = [
     "openid",
@@ -31,11 +32,8 @@ class AuthError(RuntimeError):
 
 
 def public_user(row: dict[str, Any]) -> dict[str, Any]:
-    out = {key: row[key] for key in (
-        "id", "email", "name", "avatar_url", "is_admin", "created_at", "last_login_at"
-    ) if key in row}
-    out["is_admin"] = bool(out.get("is_admin"))
-    return out
+    return {key: row[key] for key in ("id", "email", "name", "avatar_url", "created_at", "last_login_at")
+            if key in row}
 
 
 def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
@@ -47,47 +45,27 @@ def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
     avatar = str(claims.get("picture") or "")[:1000]
     if not subject or not email or not verified:
         raise AuthError("Google did not return a verified email address.")
-    allowed = config.allowed_emails()
-    if allowed and email not in allowed:
-        raise AuthError("This email address is not allowed to use this app.")
 
     now = time.time()
-    conn = db.connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    row = db.find_one("users", {"google_sub": subject})
+    if row is None:
+        by_email = db.find_one("users", {"email": email})
+        if by_email is not None and by_email.get("google_sub") not in (None, "", subject):
+            raise AuthError("That email is already linked to another Google account.")
+        row = by_email
+    if row is None:
         try:
-            row = conn.execute("SELECT * FROM users WHERE google_sub = ?", (subject,)).fetchone()
+            row = db.insert("users", {"email": email, "name": name, "google_sub": subject,
+                                      "avatar_url": avatar, "created_at": now, "last_login_at": now})
+        except DuplicateKeyError:  # the same person signed in twice at once
+            row = db.find_one("users", {"google_sub": subject}) or db.find_one("users", {"email": email})
             if row is None:
-                by_email = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-                if by_email is not None and by_email["google_sub"] not in (None, "", subject):
-                    raise AuthError("That email is already linked to another Google account.")
-                row = by_email
-            owners = config.admin_emails()
-            if row is None:
-                first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
-                is_admin = email in owners if owners else first
-                user_id = db.new_id()
-                conn.execute(
-                    "INSERT INTO users (id, email, name, password_hash, google_sub, avatar_url, "
-                    "is_admin, created_at, last_login_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?)",
-                    (user_id, email, name, subject, avatar, int(is_admin), now, now),
-                )
-            else:
-                user_id = row["id"]
-                conn.execute(
-                    "UPDATE users SET email = ?, name = ?, google_sub = ?, avatar_url = ?, "
-                    "last_login_at = ? WHERE id = ?",
-                    (email, name, subject, avatar, now, user_id),
-                )
-                if owners:  # when owners are named, that list decides who is one
-                    conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (int(email in owners), user_id))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    finally:
-        conn.close()
-    return public_user(db.one("SELECT * FROM users WHERE id = ?", (user_id,)))
+                raise AuthError("Sign-in could not be completed. Try again.") from None
+    if row.get("last_login_at") != now:
+        db.update("users", row["id"], email=email, name=name, google_sub=subject, avatar_url=avatar,
+                  last_login_at=now)
+        row = db.find_one("users", {"id": row["id"]})
+    return public_user(row)
 
 
 def _digest(value: str) -> str:
@@ -116,8 +94,8 @@ def google_authorization_url(client_config: dict[str, Any], redirect_uri: str) -
 
 
 def _consume_oauth_state(state: str) -> dict[str, Any]:
-    row = db.one("SELECT * FROM oauth_states WHERE state_hash = ?", (_digest(state),))
-    db.execute("DELETE FROM oauth_states WHERE state_hash = ?", (_digest(state),))
+    row = db.find_one("oauth_states", {"state_hash": _digest(state)})
+    db.delete("oauth_states", {"state_hash": _digest(state)})
     if not row or float(row["expires_at"]) <= time.time():
         raise AuthError("The Google sign-in expired. Start again.")
     return row
@@ -164,40 +142,24 @@ def user_for_token(token: str | None) -> dict[str, Any] | None:
     if not token:
         return None
     now = time.time()
-    row = db.one(
-        "SELECT u.*, s.last_seen_at FROM sessions s JOIN users u ON u.id = s.user_id "
-        "WHERE s.token_hash = ? AND s.expires_at > ?", (_digest(token), now))
-    if not row:
+    session = db.find_one("sessions", {"token_hash": _digest(token), "expires_at": {"$gt": now}})
+    if not session:
         return None
-    if now - float(row["last_seen_at"]) > 60:
-        db.execute("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?", (now, _digest(token)))
-    return public_user(row)
+    user = db.find_one("users", {"id": session["user_id"]})
+    if not user:
+        return None
+    if now - float(session["last_seen_at"]) > 60:
+        db.update_where("sessions", {"token_hash": _digest(token)}, {"last_seen_at": now})
+    return public_user(user)
 
 
 def delete_session(token: str | None) -> None:
     if token:
-        db.execute("DELETE FROM sessions WHERE token_hash = ?", (_digest(token),))
+        db.delete("sessions", {"token_hash": _digest(token)})
 
 
-def stats() -> dict[str, int]:
+def purge_expired() -> None:
+    """Drop sessions and sign-in attempts that have run out."""
     now = time.time()
-    db.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
-    db.execute("DELETE FROM oauth_states WHERE expires_at <= ?", (now,))
-    total = db.one("SELECT COUNT(*) AS n FROM users")["n"]
-    active = db.one(
-        "SELECT COUNT(DISTINCT user_id) AS n FROM sessions WHERE expires_at > ? AND last_seen_at >= ?",
-        (now, now - ACTIVE_SECONDS),
-    )["n"]
-    return {"total_users": total, "active_users": active}
-
-
-def list_users() -> list[dict[str, Any]]:
-    cutoff = time.time() - ACTIVE_SECONDS
-    return db.query(
-        "SELECT u.id, u.email, u.name, u.avatar_url, u.is_admin, u.created_at, u.last_login_at, "
-        "MAX(s.last_seen_at) AS last_seen_at, "
-        "CASE WHEN MAX(s.last_seen_at) >= ? THEN 1 ELSE 0 END AS active "
-        "FROM users u LEFT JOIN sessions s ON s.user_id = u.id AND s.expires_at > ? "
-        "GROUP BY u.id ORDER BY u.created_at ASC",
-        (cutoff, time.time()),
-    )
+    db.delete("sessions", {"expires_at": {"$lte": now}})
+    db.delete("oauth_states", {"expires_at": {"$lte": now}})

@@ -105,6 +105,25 @@ def put(path: Path, key: str, content_type: str) -> str:
     return PREFIX + key
 
 
+def get(ref: str, dest: Path) -> Path:
+    """Download a stored file to `dest`."""
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _client().download_file(cfg()["bucket"], ref.removeprefix(PREFIX), str(dest))
+    except StorageError:
+        raise
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise StorageError(_explain(exc)) from None
+    return dest
+
+
+def require_when_hosted() -> None:
+    """A hosted server keeps nothing on its own disk, so without storage a clip would be lost."""
+    if config.public_url() and not enabled():
+        raise StorageError("This server is not set up to store clips yet. Try again later.")
+
+
 def url(ref: str, *, download_name: str | None = None) -> str:
     params: dict[str, Any] = {"Bucket": cfg()["bucket"], "Key": ref.removeprefix(PREFIX)}
     if download_name:
@@ -164,42 +183,3 @@ def check() -> dict[str, Any]:
     if got.status_code != 200:
         raise StorageError(f"The file was saved but could not be read back (HTTP {got.status_code}).")
     return {"ok": True, "bucket": c["bucket"], "seconds": round(time.time() - started, 1)}
-
-
-def local_clip_count() -> int:
-    rows = db.query("SELECT COUNT(*) AS n FROM clips WHERE status = 'ready' AND file IS NOT NULL "
-                    "AND file NOT LIKE 's3:%'")
-    return rows[0]["n"]
-
-
-def migrate_local_clips(progress=None) -> dict[str, int]:
-    """Upload clips that are still on this disk, then remove the local copies and
-    the downloaded sources of finished videos."""
-    rows = db.query("SELECT id, job_id, file, thumb FROM clips WHERE status = 'ready' AND "
-                    "file IS NOT NULL AND file NOT LIKE 's3:%'")
-    moved = 0
-    for index, row in enumerate(rows):
-        video = config.DATA / row["file"]
-        thumb = config.DATA / row["thumb"] if row["thumb"] and not is_remote(row["thumb"]) else None
-        if not video.exists():
-            continue
-        file_ref = put(video, key_for(row["job_id"], f"clips/{video.name}"), "video/mp4")
-        thumb_ref = row["thumb"]
-        if thumb and thumb.exists():
-            thumb_ref = put(thumb, key_for(row["job_id"], f"clips/{thumb.name}"), "image/jpeg")
-        db.update("clips", row["id"], file=file_ref, thumb=thumb_ref)
-        video.unlink(missing_ok=True)
-        if thumb:
-            thumb.unlink(missing_ok=True)
-        moved += 1
-        if progress:
-            progress((index + 1) / len(rows))
-    freed = 0
-    if cfg().get("delete_source"):
-        for job in db.query("SELECT id FROM jobs WHERE kind = 'video' AND status = 'done'"):
-            folder = config.JOBS_DIR / job["id"]
-            for source in folder.glob("source.*"):
-                freed += source.stat().st_size
-                source.unlink(missing_ok=True)
-            (folder / "download.done").unlink(missing_ok=True)
-    return {"moved": moved, "freed_mb": round(freed / 1e6)}

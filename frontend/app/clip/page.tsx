@@ -471,7 +471,7 @@ function ClipDetail() {
               </div>
             ) : null}
             {postOpen === "schedule" ? (
-              <Field label="Goes public at" hint="Your local time. YouTube publishes it even if this PC is off.">
+              <Field label="Goes public at" hint="Your local time. YouTube publishes it for you, even if you are offline.">
                 {(p) => <input {...p} type="datetime-local" className="field" min={minWhen} value={when} onChange={(e) => setWhen(e.target.value)} />}
               </Field>
             ) : (

@@ -33,9 +33,9 @@ defaults and trend searches are all under **Settings**.
 
 ### Accounts
 
-The public landing page leads to Google sign-in. The first Google account that signs in becomes the
-administrator. It can open **Users** to see the total number of accounts and how many have used the
-app in the last 15 minutes. Browser sessions use an opaque HttpOnly cookie.
+The public landing page leads to Google sign-in. Everyone who signs in is an ordinary user with a
+private workspace; there is no administrator and no page that lists other people. Browser sessions use
+an opaque HttpOnly cookie.
 
 Google login uses a dedicated **Web application** OAuth client in `backend/.env` as
 `GOOGLE_LOGIN_CLIENT_ID` and `GOOGLE_LOGIN_CLIENT_SECRET`. YouTube connection separately uses the
@@ -83,9 +83,10 @@ cd ..
 scripts\start.ps1
 ```
 
-Open the dashboard and sign in with Google. The first account becomes the owner (set `ADMIN_EMAILS`
-in `backend/.env` to name the owner instead). Everyone else who signs in has their own private
-workspace.
+Open the dashboard and sign in with Google. Everyone who signs in has their own private workspace,
+their own settings and AI keys, and connects their own YouTube channel. There is no administrator.
+Accounts, jobs and clips are kept in MongoDB (`MONGODB_URI` in `backend/.env`) and videos in the
+storage you configure, so the server itself keeps nothing.
 
 ## Layout
 

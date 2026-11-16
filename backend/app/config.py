@@ -27,11 +27,11 @@ API_PORT = int(os.environ.get("CLIPPER_PORT", "8765"))
 
 # Keys the user manages in Settings. Storage keys are server-side configuration:
 # they live in backend/.env only and are never shown or editable in the app.
-PUBLIC_SECRETS = ("NVIDIA_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
+PUBLIC_SECRETS = ("NVIDIA_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")  # each person can add their own
 SECRET_NAMES = PUBLIC_SECRETS + (
-    "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
     "GOOGLE_LOGIN_CLIENT_ID", "GOOGLE_LOGIN_CLIENT_SECRET",
     "BLOMP_ACCESS_KEY_ID", "BLOMP_SECRET_ACCESS_KEY",
+    "MONGODB_URI", "APP_SECRET_KEY",
 )
 PROVIDER_SECRET = {
     "nvidia": "NVIDIA_API_KEY",
@@ -111,11 +111,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
 }
 
-_env_lock = threading.Lock()
-
-
 def ensure_dirs() -> None:
-    for path in (DATA, JOBS_DIR, TOKENS_DIR):
+    for path in (DATA, JOBS_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -136,66 +133,19 @@ def public_url() -> str:
     return (secret("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
 
 
-def _email_list(name: str) -> set[str]:
-    raw = secret(name).replace(";", ",")
-    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+def mongodb_uri() -> str:
+    """Connection string for the database (MongoDB Atlas or any MongoDB). Never shown or logged."""
+    return secret("MONGODB_URI")
 
 
-def allowed_emails() -> set[str]:
-    """Optional: only these emails may sign in. Empty means anyone with a Google account can."""
-    return _email_list("ALLOWED_EMAILS")
+def mongodb_name() -> str:
+    return secret("MONGODB_DB") or "clipper"
 
 
-def admin_emails() -> set[str]:
-    """The owner(s) of the app. They can change keys and settings for everyone and post to the
-    connected YouTube channel. If none is set, the first account to sign in is the owner."""
-    return _email_list("ADMIN_EMAILS")
-
-
-def set_secret(name: str, value: str) -> None:
-    """Write one secret to backend/.env, replacing the existing line."""
-    if name not in SECRET_NAMES:
-        raise ValueError(f"Unknown secret: {name}")
-    value = value.strip()
-    if any(ch in value for ch in "\r\n\"'"):
-        raise ValueError("Key contains characters that are not allowed.")
-    with _env_lock:
-        lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
-        replaced = False
-        for i, line in enumerate(lines):
-            if line.split("=", 1)[0].strip() == name:
-                lines[i] = f"{name}={value}"
-                replaced = True
-        if not replaced:
-            lines.append(f"{name}={value}")
-        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.environ.pop(name, None)
-
-
-def secret_status() -> dict[str, dict[str, Any]]:
-    """Safe view of secrets for the UI: whether set, and the last 4 characters."""
-    out = {}
-    for name in PUBLIC_SECRETS:
-        value = secret(name)
-        out[name] = {"set": bool(value), "hint": f"…{value[-4:]}" if len(value) >= 12 else ""}
-    return out
-
-
-def google_oauth_client() -> dict[str, Any] | None:
-    """YouTube Desktop OAuth configuration assembled only from backend/.env."""
-    client_id = secret("GOOGLE_CLIENT_ID")
-    client_secret = secret("GOOGLE_CLIENT_SECRET")
-    if not (client_id and client_secret):
-        return None
-    return {
-        "installed": {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": ["http://localhost"],
-        }
-    }
+def platform_key(name: str) -> str:
+    """A key the server owner provides for everyone. Only the NVIDIA key is shared; for any other
+    provider each person adds their own."""
+    return secret(name) if name == "NVIDIA_API_KEY" else ""
 
 
 def google_login_oauth_client() -> dict[str, Any] | None:
@@ -212,6 +162,14 @@ def google_login_oauth_client() -> dict[str, Any] | None:
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
+
+
+def prune_to(defaults: Any, value: Any) -> Any:
+    """Keep only the settings that exist. Anything else a client sends (unknown names, operators like
+    `$where`) is dropped before it is merged or saved."""
+    if isinstance(defaults, dict) and isinstance(value, dict):
+        return {k: prune_to(defaults[k], v) for k, v in value.items() if k in defaults}
+    return value
 
 
 def deep_merge(base: dict, override: dict | None) -> dict:

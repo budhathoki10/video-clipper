@@ -41,7 +41,7 @@ YouTube channel immediately or on a schedule, all without staying in front of th
 ## 2. Architecture at a glance
 
 ```
-Browser  ──►  FastAPI (app.main)  ──►  SQLite (data/clipper.db)  ◄──  Worker (app.worker)
+Browser  ──►  FastAPI (app.main)  ──►  MongoDB  ◄──  Worker (app.worker)
  (Next.js          │  serves the static dashboard                          │ runs jobs
   static export)   │  queues jobs, never does heavy work                   │ in threads
                    ▼                                                       ▼
@@ -49,7 +49,7 @@ Browser  ──►  FastAPI (app.main)  ──►  SQLite (data/clipper.db)  ◄
 ```
 
 - **Two Python processes.** `app.main` (the dashboard API, started by uvicorn) and `app.worker` (a
-  detached background process). They communicate only through the SQLite database. The API starts the
+  detached background process). They communicate only through the MongoDB database. The API starts the
   worker if it is not running (`ensure_worker`).
 - **Jobs are rows in the `jobs` table.** The API inserts a row with `status='queued'`; the worker claims
   it. If the worker or the PC stops mid-job, on the next start every `running` job goes back to
@@ -57,17 +57,26 @@ Browser  ──►  FastAPI (app.main)  ──►  SQLite (data/clipper.db)  ◄
 - **The dashboard is a static export** of a Next.js app (`frontend/out`). The Python API serves it at
   `/`, so production needs no Node process. In development the dashboard runs on `:3000` and calls the
   API on `:8765` (`NEXT_PUBLIC_API_URL` in `frontend/.env.development`).
-- **No Redis, no external queue.** SQLite in WAL mode lets both processes read and write concurrently.
+- **No Redis, no external queue.** Jobs are documents in MongoDB; the worker takes one with an atomic
+  update (`db.claim_job`), so two workers can never run the same job.
 - **Google accounts protect the API.** Google OpenID Connect supplies a verified identity; the stable
   `sub` claim identifies the account. The browser receives an opaque 30-day HttpOnly session cookie;
-  only its SHA-256 digest is stored. Anyone with a Google account can sign in. Jobs and posts carry a
-  `user_id`; each person sees only their own work and has their own clip/format/caption settings. The
-  owner (`ADMIN_EMAILS`, or the first account if none is set) sees everything and alone changes keys,
-  the AI engine, storage and the YouTube channel, and posts to it. A person may have two videos in
-  progress at a time. `ALLOWED_EMAILS` can still restrict who may sign in.
+  only its SHA-256 digest is stored. Anyone with a Google account can sign in; there are no roles.
+  Jobs, clips and posts carry a `user_id` and each person sees only their own. Settings, AI keys and the
+  YouTube channel are per person; API keys and YouTube tokens are encrypted with `APP_SECRET_KEY` before
+  they reach the database. The one shared secret is the platform NVIDIA key. A person may have three
+  videos in progress at a time; video length is not limited.
+- **MongoDB is the only database.** `db.py` wraps it (documents have a string `id`; `kv` holds app
+  settings, per-person settings and the worker heartbeat). The API and the worker are separate processes
+  that share it. Tests use an in-memory stand-in (`mongomock`), or a real MongoDB when
+  `CLIPPER_TEST_MONGODB_URI` is set.
+- **The server keeps nothing.** Downloaded videos, working files (transcript, signals) and finished clips
+  are in S3-compatible storage. While a job runs they are in a scratch folder; when it finishes
+  `runner.persist_job_files` uploads them and clears the folder, and `restore_job_files` brings them back
+  for "more clips", re-rendering and hooks.
 
 ### Technology
-Python 3.11+ (developed on 3.13), FastAPI, SQLite, yt-dlp, ffmpeg (NVENC when available, x264
+Python 3.11+ (developed on 3.13), FastAPI, MongoDB (pymongo), yt-dlp, ffmpeg (NVENC when available, x264
 otherwise), faster-whisper (GPU first, CPU fallback), boto3 (S3-compatible storage), Google API client
 (YouTube). Frontend: Next.js 16 (App Router, static export), React 19, Tailwind CSS 4, lucide-react.
 
@@ -96,7 +105,8 @@ backend/
     storage.py                 remote storage (S3-compatible) for finished clips
     youtube.py                 channel sign-in, upload, schedule, view counts
     config.py                  paths, default settings, secret handling
-    db.py                      SQLite access, schema, settings storage
+    db.py                      MongoDB access, indexes, settings storage
+    keys.py                    encrypted per-person API keys and YouTube tokens
     pipeline/
       media.py                 yt-dlp + ffmpeg helpers (probe, download, audio, encoder choice)
       transcribe.py            word-level transcription
@@ -202,7 +212,7 @@ are topic-neutral. The summary (per-type watch time, sample comments) is stored 
 
 ---
 
-## 5. Data model (SQLite, `db.py`)
+## 5. Data model (MongoDB collections, `db.py`)
 
 Tables are created by `db.init()`; new columns are added there with `ALTER TABLE` when missing.
 
@@ -217,15 +227,18 @@ Tables are created by `db.init()`; new columns are added there with `ALTER TABLE
 - `posts(id, clip_id, status, title, description, privacy, publish_at, youtube_id, views, error, created_at, updated_at, kind)`
   - `kind` is `short` or `video`.
 - `kv(key, value)`: JSON values. Keys: `settings` (user overrides), `trends` and `trends:<slug>`
-  (trend profiles), `youtube` (sign-in state), `worker` (heartbeat).
-- `users(id, email, name, google_sub, avatar_url, is_admin, created_at, last_login_at)`: Google
-  accounts. The first verified Google user is the administrator.
+  (trend profiles), `worker` (heartbeat).
+- `users(id, email, name, google_sub, avatar_url, created_at, last_login_at)`: Google accounts. Everyone
+  is an ordinary user.
+- `user_keys(_id "<user>:<name>", user_id, name, value, hint)`: a person's own API keys, encrypted.
+- `youtube(_id <user>, user_id, token, channel)`: a person's connected channel; the token is encrypted.
 - `sessions(token_hash, user_id, created_at, last_seen_at, expires_at)`: opaque browser sessions.
-  A user is shown as active when a valid session was seen in the last 15 minutes.
 - `oauth_states(state_hash, code_verifier, redirect_uri, created_at, expires_at)`: one-time,
   ten-minute Google OAuth state and PKCE data used to prevent callback forgery.
 
-JSON columns are encoded/decoded automatically (`db.JSON_COLS`).
+Jobs and clips also carry `user_id` (the owner). A job has `files` (storage references to its saved
+working files and downloaded video). `kv` keys also include `prefs:<user_id>` (a person's settings) and
+`youtube-connect:<user_id>` (a pending channel sign-in).
 
 ---
 
@@ -253,25 +266,25 @@ A new job takes the saved settings plus per-job overrides (`clip`, `format`, `ca
 `config.DEFAULT_SETTINGS['storage']` (endpoint, region, bucket, prefix, `enabled`, `delete_source`) is
 configuration, not a user setting. `GET/PUT /api/settings` hide and ignore it (`HIDDEN_SETTINGS`).
 
-### Secrets: `backend/.env` (gitignored)
+### Secrets: `backend/.env` (gitignored) or the host's environment
 
 | Name | Purpose | Visible to users? |
 |---|---|---|
-| `NVIDIA_API_KEY` | Default AI provider (NVIDIA Nemotron Ultra) | Only whether set + last 4 characters; replaceable in Settings |
-| `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | Alternative providers | Same |
-| `GOOGLE_LOGIN_CLIENT_ID`, `GOOGLE_LOGIN_CLIENT_SECRET` | Google Web OAuth client for app login | **No**; read only from `.env` and never returned by the API |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google Desktop OAuth client for YouTube | **No**; read only from `.env` and never returned by the API |
-| `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY` | Remote storage keys | **No**; not in any API response, not editable in the UI |
-| `BLOMP_BUCKET` | Storage bucket name | **No** |
+| `MONGODB_URI` (`MONGODB_DB`) | The database connection string | **No**; never in a response or log |
+| `APP_SECRET_KEY` | Encrypts people's saved API keys and YouTube tokens | **No** |
+| `NVIDIA_API_KEY` | The shared key everyone uses by default for NVIDIA Nemotron Ultra | **No**; people only see "shared key included" |
+| `GOOGLE_LOGIN_CLIENT_ID`, `GOOGLE_LOGIN_CLIENT_SECRET` | Google Web OAuth client: sign-in and each person's YouTube connection | **No** |
+| `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY`, `BLOMP_BUCKET` | Storage keys and bucket | **No**; not in any response, not editable in the UI |
+| `PUBLIC_URL` | The address people open when hosted | n/a |
 
-`config.PUBLIC_SECRETS` are the keys the Settings page may show status for and replace;
-`config.SECRET_NAMES` also includes the Google and storage values. Never write a real key into source, tests, docs
-or any response. `config.set_secret` rewrites one line of `.env`.
+A person's own Anthropic, Gemini or NVIDIA key is entered in Settings and stored encrypted in the
+database (`keys.py`); the API only reports whether it is set and its last four characters. Never write a
+real key into source, tests, docs or any response. `config.SECRET_NAMES` lists every value the tests
+check for leaks.
 
-### Files under `data/` (gitignored)
-`clipper.db`, `jobs/<id>/` (working files), `tokens/` (Google sign-in token), `tmp/`,
-`server.log`, `server-errors.log`, `worker.log`, `test-run/` (test database and output).
-`CLIPPER_DATA_DIR` moves the whole folder (the tests use this).
+### Files under the data folder (`CLIPPER_DATA_DIR`, gitignored)
+Scratch space only: `jobs/<id>/` (the video being processed, removed when the job finishes), `tmp/`,
+`worker.log`, `test-run/`. Everything lasting is in MongoDB and the storage.
 
 ---
 
@@ -279,7 +292,8 @@ or any response. `config.set_secret` rewrites one line of `.env`.
 
 `complete()` and `complete_json()` hide four providers behind one call: NVIDIA (default model
 `nvidia/nemotron-3-ultra-550b-a55b` via NVIDIA's OpenAI-compatible endpoint), Anthropic, Gemini and
-Ollama (local). The provider and model come from settings; the key comes from `config.secret`.
+Ollama (local). The provider and model are the person's own setting and the key is theirs (`keys.effective`): their own
+key, or for NVIDIA the shared one. Jobs run under `llm.as_user(job.user_id)`.
 Retries with backoff on rate limits and server errors; 401/403 and 404 produce clear messages. JSON
 answers are parsed tolerantly (fences, stray prose) with one retry. To add a provider: add a branch in
 `llm._request`, an entry in `config.PROVIDER_SECRET` and `DEFAULT_SETTINGS['ai']['models']`, a
@@ -401,7 +415,7 @@ before sending a clip.
 
 - **Pages:** public landing and Google sign-in; Home (paste a link, per-video options, jobs, top clips), Clips (library with search,
   filters, sort, paging), Clip (preview, edit, hook suggestions, post/schedule, audience panel), Live
-  (activity graph and clips per stream), Posts (table), Trends, Users (administrator only), Settings (tabs: Clips, Format, Captions
+  (activity graph and clips per stream), Posts (table), Trends, Settings (tabs: Clips, Format, Captions
   with live preview, AI engine, Live streams, Posting, Trends).
 - **State:** no state library. `useApi(path, interval)` in `lib/api.ts` fetches and polls while the tab
   is visible. All API types live in `lib/api.ts`.
@@ -478,7 +492,7 @@ Windows notes: ffmpeg filter paths are kept relative (run with `cwd`); subproces
 | Decision | Why |
 |---|---|
 | Separate worker process | Closing the browser or API must not stop work; jobs resume after a crash or reboot |
-| SQLite, no Redis | One PC, two processes; WAL gives enough concurrency |
+| MongoDB, no Redis | One shared database for the API and the worker; accounts, jobs and settings survive any server |
 | Static dashboard served by the API | One address, no Node in production |
 | Free signals before the AI | Cheap, and they point the AI at the right parts of a long video |
 | Rank candidates together | Scores from separate calls are not comparable |
