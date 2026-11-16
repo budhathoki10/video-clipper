@@ -5,8 +5,10 @@ stays in data/tokens/ (gitignored). None is ever returned by the API.
 """
 from __future__ import annotations
 
+import hmac
 import os
 import threading
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,20 +52,82 @@ class _OpenAndRemember(webbrowser.BaseBrowser):
         return True
 
 
+WEB_CONNECT_SECONDS = 600
+
+
+def hosted() -> bool:
+    """A hosted app cannot use the local sign-in (Google redirects to this computer's
+    own address). It uses a normal web redirect to PUBLIC_URL instead."""
+    return bool(config.public_url())
+
+
+def _web_pending(state: dict[str, Any]) -> bool:
+    return bool(state.get("state")) and time.time() < state.get("expires", 0)
+
+
 def status() -> dict[str, Any]:
     state = db.kv_get("youtube", {}) or {}
+    waiting = _connect_lock.locked() or (hosted() and _web_pending(state))
     return {
-        "auth_url": state.get("auth_url", "") if _connect_lock.locked() else "",
+        "auth_url": state.get("auth_url", "") if waiting else "",
         "client_configured": client_configured(),
         "connected": TOKEN_FILE.exists(),
         "channel": state.get("channel", "") if TOKEN_FILE.exists() else "",
-        "connecting": _connect_lock.locked(),
+        "connecting": waiting,
         "error": state.get("error", ""),
     }
 
 
 def client_configured() -> bool:
-    return config.google_oauth_client() is not None
+    # Hosted: the Web application client that also does the app sign-in. Local: the Desktop client.
+    return (config.google_login_oauth_client() if hosted() else config.google_oauth_client()) is not None
+
+
+def web_redirect_uri() -> str:
+    return f"{config.public_url()}/api/youtube/callback"
+
+
+def start_web_connect() -> str:
+    """Hosted sign-in, step 1: the Google page to send the browser to. The one-time state and
+    PKCE verifier are kept server-side until Google sends the browser back."""
+    from google_auth_oauthlib.flow import Flow
+
+    oauth_config = config.google_login_oauth_client()
+    if oauth_config is None:
+        raise YouTubeError("Google OAuth is not configured on the server. Set GOOGLE_LOGIN_CLIENT_ID "
+                           "and GOOGLE_LOGIN_CLIENT_SECRET.")
+    flow = Flow.from_client_config(oauth_config, SCOPES, redirect_uri=web_redirect_uri())
+    url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    db.kv_set("youtube", {"auth_url": url, "state": state, "verifier": flow.code_verifier,
+                          "expires": time.time() + WEB_CONNECT_SECONDS})
+    return url
+
+
+def finish_web_connect(state: str, code: str) -> None:
+    """Hosted sign-in, step 2: exchange Google's code for the channel token."""
+    from google_auth_oauthlib.flow import Flow
+
+    saved = db.kv_get("youtube", {}) or {}
+    if not (_web_pending(saved) and state and hmac.compare_digest(str(saved["state"]), state)):
+        raise YouTubeError("That sign-in link expired. Press Connect YouTube again.")
+    oauth_config = config.google_login_oauth_client()
+    if oauth_config is None:
+        raise YouTubeError("Google OAuth is not configured on the server.")
+    flow = Flow.from_client_config(oauth_config, SCOPES, state=state, redirect_uri=web_redirect_uri())
+    flow.code_verifier = saved.get("verifier")
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        db.kv_set("youtube", {})
+        raise YouTubeError(f"Google did not accept the sign-in: {str(exc)[:160]}") from None
+    TOKEN_FILE.write_text(flow.credentials.to_json(), encoding="utf-8")
+    channel = ""
+    try:
+        items = _service().channels().list(part="snippet", mine=True).execute().get("items", [])
+        channel = items[0]["snippet"]["title"] if items else ""
+    except Exception:
+        pass
+    db.kv_set("youtube", {"channel": channel})
 
 
 def _credentials():

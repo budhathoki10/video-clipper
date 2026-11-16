@@ -156,10 +156,25 @@ def clip_out(clip: dict[str, Any]) -> dict[str, Any]:
 
 # ---- accounts --------------------------------------------------------------
 def _set_session(response: Response, token: str, request: Request) -> None:
+    secure = request.url.scheme == "https" or config.public_url().startswith("https://")
     response.set_cookie(
         auth.SESSION_COOKIE, token, max_age=auth.SESSION_DAYS * 86400,
-        httponly=True, secure=request.url.scheme == "https", samesite="lax", path="/",
+        httponly=True, secure=secure, samesite="lax", path="/",
     )
+
+
+def _callback_uri(request: Request, route: str) -> str:
+    """Google must send the browser back to the address people actually use. Behind a hosting
+    proxy the request's own address is internal, so PUBLIC_URL wins when it is set."""
+    base = config.public_url()
+    return f"{base}{request.app.url_path_for(route)}" if base else str(request.url_for(route))
+
+
+def _require_admin_when_hosted(request: Request) -> None:
+    # One channel is connected for the whole app, so on a shared server only the owner may change it.
+    user = getattr(request.state, "user", None)
+    if config.public_url() and not (user and user["is_admin"]):
+        raise fail(403, "Only the administrator can change the YouTube connection.")
 
 
 @app.get("/api/auth/google/status")
@@ -173,7 +188,7 @@ def google_auth_start(request: Request):
     if oauth_config is None:
         query = urlencode({"error": "Google sign-in is not configured yet."})
         return RedirectResponse(f"/login/?{query}", status_code=303)
-    redirect_uri = str(request.url_for("google_auth_callback"))
+    redirect_uri = _callback_uri(request, "google_auth_callback")
     try:
         url = auth.google_authorization_url(oauth_config, redirect_uri)
     except Exception:
@@ -579,16 +594,36 @@ def youtube_status() -> dict[str, Any]:
 
 
 @app.post("/api/youtube/connect", status_code=202)
-def youtube_connect() -> dict[str, Any]:
+def youtube_connect(request: Request) -> dict[str, Any]:
+    _require_admin_when_hosted(request)
     try:
+        if youtube.hosted():
+            return {**youtube.status(), "connecting": True, "redirect_to": youtube.start_web_connect()}
         youtube.connect_in_background()
     except youtube.YouTubeError as exc:
         raise fail(409, str(exc)) from None
     return {**youtube.status(), "connecting": True}
 
 
+@app.get("/api/youtube/callback")
+def youtube_callback(request: Request, state: str = "", code: str = "", error: str = ""):
+    """Where Google sends the browser back to after a hosted channel sign-in."""
+    _require_admin_when_hosted(request)
+    if error or not code:
+        message = ("The YouTube sign-in did not finish. Press Connect YouTube again."
+                   if error and error != "access_denied" else "The YouTube sign-in was cancelled.")
+        db.kv_set("youtube", {"error": message})
+    else:
+        try:
+            youtube.finish_web_connect(state, code)
+        except youtube.YouTubeError as exc:
+            db.kv_set("youtube", {"error": str(exc)})
+    return RedirectResponse("/settings/#youtube", status_code=303)
+
+
 @app.post("/api/youtube/disconnect")
-def youtube_disconnect() -> dict[str, Any]:
+def youtube_disconnect(request: Request) -> dict[str, Any]:
+    _require_admin_when_hosted(request)
     youtube.disconnect()
     return youtube.status()
 
