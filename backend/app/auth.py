@@ -12,7 +12,7 @@ import secrets
 import time
 from typing import Any
 
-from . import db
+from . import config, db
 
 SESSION_COOKIE = "clipper_session"
 SESSION_DAYS = 30
@@ -47,6 +47,9 @@ def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
     avatar = str(claims.get("picture") or "")[:1000]
     if not subject or not email or not verified:
         raise AuthError("Google did not return a verified email address.")
+    allowed = config.allowed_emails()
+    if allowed and email not in allowed:
+        raise AuthError("This email address is not allowed to use this app.")
 
     now = time.time()
     conn = db.connect()
@@ -60,6 +63,9 @@ def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
                     raise AuthError("That email is already linked to another Google account.")
                 row = by_email
             if row is None:
+                if config.public_url() and not allowed:
+                    raise AuthError("Sign-up is closed. The owner must add ALLOWED_EMAILS to the "
+                                    "server settings first.")
                 first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
                 user_id = db.new_id()
                 conn.execute(

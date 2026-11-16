@@ -129,6 +129,18 @@ def secret(name: str) -> str:
     return ""
 
 
+def public_url() -> str:
+    """Address people use when the app is hosted (for example https://clipper.onrender.com).
+    Empty when it runs on one computer. Hosted mode closes sign-up unless ALLOWED_EMAILS is set."""
+    return secret("PUBLIC_URL").rstrip("/")
+
+
+def allowed_emails() -> set[str]:
+    """Emails that may sign in. Empty means no list is set."""
+    raw = secret("ALLOWED_EMAILS").replace(";", ",")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
 def set_secret(name: str, value: str) -> None:
     """Write one secret to backend/.env, replacing the existing line."""
     if name not in SECRET_NAMES:

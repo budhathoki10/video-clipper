@@ -792,3 +792,37 @@ def test_ping_route_is_public_and_does_no_work(monkeypatch):
             response = getattr(anonymous, method)("/api/ping")
             assert response.status_code == 200, method
         assert anonymous.get("/api/ping").json() == {"ok": True}, "no state is returned"
+
+
+def test_only_allowed_emails_can_sign_in(monkeypatch):
+    from app import auth
+
+    def claims(email, sub):
+        return {"sub": sub, "email": email, "email_verified": True, "name": "Someone"}
+
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
+    monkeypatch.setenv("ALLOWED_EMAILS", "Owner@Example.com, friend@example.com")
+    with pytest.raises(auth.AuthError, match="not allowed"):
+        auth.upsert_google_user(claims("stranger@example.com", "s1"))
+    assert db.one("SELECT COUNT(*) AS n FROM users")["n"] == 0, "a refused sign-in creates no account"
+    owner = auth.upsert_google_user(claims("owner@example.com", "s2"))
+    friend = auth.upsert_google_user(claims("friend@example.com", "s3"))
+    assert owner["is_admin"] is True and friend["is_admin"] is False
+    db.execute("DELETE FROM users")
+
+
+def test_a_hosted_app_without_an_allow_list_keeps_sign_up_closed(monkeypatch):
+    from app import auth
+
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
+    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com/")
+    assert config.public_url() == "https://clipper.example.com"
+    with pytest.raises(auth.AuthError, match="closed"):
+        auth.upsert_google_user({"sub": "s9", "email": "a@example.com", "email_verified": True})
+    assert db.one("SELECT COUNT(*) AS n FROM users")["n"] == 0
+    monkeypatch.delenv("PUBLIC_URL")
+    assert auth.upsert_google_user({"sub": "s9", "email": "a@example.com", "email_verified": True})["is_admin"]
+    db.execute("DELETE FROM users")
