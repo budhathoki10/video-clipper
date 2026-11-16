@@ -131,15 +131,25 @@ def secret(name: str) -> str:
 
 def public_url() -> str:
     """Address people use when the app is hosted (for example https://clipper.onrender.com).
-    Empty when it runs on one computer. Hosted mode closes sign-up unless ALLOWED_EMAILS is set."""
+    Empty when it runs on one computer."""
     # Render sets RENDER_EXTERNAL_URL itself, so a Render deploy needs no extra setting.
     return (secret("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
 
 
-def allowed_emails() -> set[str]:
-    """Emails that may sign in. Empty means no list is set."""
-    raw = secret("ALLOWED_EMAILS").replace(";", ",")
+def _email_list(name: str) -> set[str]:
+    raw = secret(name).replace(";", ",")
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def allowed_emails() -> set[str]:
+    """Optional: only these emails may sign in. Empty means anyone with a Google account can."""
+    return _email_list("ALLOWED_EMAILS")
+
+
+def admin_emails() -> set[str]:
+    """The owner(s) of the app. They can change keys and settings for everyone and post to the
+    connected YouTube channel. If none is set, the first account to sign in is the owner."""
+    return _email_list("ADMIN_EMAILS")
 
 
 def set_secret(name: str, value: str) -> None:

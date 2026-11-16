@@ -40,7 +40,7 @@ In the project you already use for sign-in:
 
 | Variable | What to enter |
 |---|---|
-| `ALLOWED_EMAILS` | Your Google email, plus anyone else who may sign in (comma separated) |
+| `ADMIN_EMAILS` | Your Google email: the owner of the app (comma separated for more than one) |
 | `GOOGLE_LOGIN_CLIENT_ID`, `GOOGLE_LOGIN_CLIENT_SECRET` | From the Web application OAuth client |
 | `NVIDIA_API_KEY` | Your NVIDIA key (or leave empty and use another provider) |
 | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | Only if you use those providers |
@@ -51,12 +51,31 @@ environment variable yourself only if you use a custom domain.
 
 ## 3. First sign-in
 
-Open the address, press **Continue with Google** and sign in with an address in `ALLOWED_EMAILS`. The
-first account to sign in is the administrator. Then open **Settings > Posting > Connect YouTube**. Only
-the administrator can connect or disconnect the channel on a hosted app.
+Open the address, press **Continue with Google** and sign in with the address in `ADMIN_EMAILS`. That
+account is the owner. Then open **Settings > Posting > Connect YouTube**. Only an owner can connect or
+disconnect the channel on a hosted app.
 
-If the sign-in says the address is not allowed, or that sign-up is closed, check `ALLOWED_EMAILS` in
-Render's Environment tab.
+**Set `ADMIN_EMAILS` before you tell anyone the address.** Anyone with a Google account can sign in. If
+`ADMIN_EMAILS` is empty, whoever signs in first becomes the owner.
+
+## Who can use the app
+
+Anyone with a Google account can sign in and make clips. There is no sign-up list. Each person:
+
+- sees, edits and deletes only their own videos and clips, and has their own clip, format and caption
+  settings;
+- can have 2 videos in progress at a time, and videos longer than 90 minutes are cut off;
+- can download their clips.
+
+Only owners can change the AI keys and engine, storage, trends and the YouTube connection, see the user
+list, and **post to the connected YouTube channel**. A guest who tries gets a clear message and is told
+to download the clip. The owner sees everyone's work.
+
+To close the app to named people instead, set `ALLOWED_EMAILS` (comma separated). Anyone else is refused
+at sign-in.
+
+Every guest uses your server's CPU and memory, your AI quota and your storage. The limits above are the
+only controls, so watch your usage if the address spreads.
 
 ## 4. Keeping it awake (only if you do not use a paid always-on plan)
 
@@ -75,7 +94,8 @@ home-screen app (it does not share Safari's login).
 | Symptom | Likely cause |
 |---|---|
 | Google says `redirect_uri_mismatch` | The two redirect URIs in step 1 do not match your address exactly (scheme, host, no trailing slash) |
-| "Sign-up is closed" | `ALLOWED_EMAILS` is empty |
+| "This email address is not allowed" | `ALLOWED_EMAILS` is set and does not include that email |
+| You are not the owner after signing in | `ADMIN_EMAILS` does not match your Google email exactly |
 | Jobs fail while downloading | YouTube is blocking the server's address |
 | Everything resets after a restart | The service is on a plan without a disk, or `CLIPPER_DATA_DIR` is not `/data` |
 | Build fails | Open the build log in Render; `docker build -t clipper .` reproduces it locally |

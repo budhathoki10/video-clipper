@@ -65,7 +65,8 @@ async def lifespan(_: FastAPI):
     watcher.cancel()
 
 
-app = FastAPI(title="Clipper", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="Clipper", lifespan=lifespan, docs_url=None if config.public_url() else "/api/docs",
+              openapi_url=None if config.public_url() else "/api/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -74,7 +75,7 @@ app.add_middleware(
 
 PUBLIC_API = {
     "/api/auth/google", "/api/auth/google/callback", "/api/auth/google/status", "/api/auth/logout",
-    "/api/health", "/api/ping", "/api/docs", "/api/openapi.json",
+    "/api/health", "/api/ping",
 }
 
 
@@ -128,11 +129,78 @@ def fail(status: int, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail=message)
 
 
+# ---- who may see and change what ---------------------------------------------
+# Everyone with a Google account can sign in and make clips. Each person sees only their own
+# videos, clips and settings. The owner (an administrator) sees everything and is the only one who
+# can change keys, the AI engine and the YouTube channel, or post to that channel.
+MAX_ACTIVE_JOBS = 2  # videos one person may have in progress at once (the owner is not limited)
+MAX_MINUTES_FOR_GUESTS = 90
+
+
+def _me(request: Request) -> dict[str, Any] | None:
+    return getattr(request.state, "user", None)
+
+
+def _is_admin(request: Request) -> bool:
+    user = _me(request)
+    return user is None or bool(user["is_admin"])  # no user: sign-in is switched off (local development)
+
+
+def _user_id(request: Request) -> str | None:
+    user = _me(request)
+    return user["id"] if user else None
+
+
+def _require_admin(request: Request, message: str) -> None:
+    if not _is_admin(request):
+        raise fail(403, message)
+
+
+def _visible(request: Request, alias: str = "j") -> tuple[str, tuple]:
+    """SQL that limits a query on jobs to the signed-in person's own (the owner sees all)."""
+    if _is_admin(request):
+        return "", ()
+    return f" AND {alias}.user_id = ?", (_user_id(request),)
+
+
+def _job_for(request: Request, job_id: str, columns: str = "j.*") -> dict[str, Any]:
+    scope, extra = _visible(request)
+    job = db.one(f"SELECT {columns} FROM jobs j WHERE j.id = ?{scope}", (job_id, *extra))
+    if not job:  # someone else's job looks exactly like one that does not exist
+        raise fail(404, "That job does not exist.")
+    return job
+
+
+def _clip_for(request: Request, clip_id: str, columns: str = "c.*") -> dict[str, Any]:
+    scope, extra = _visible(request)
+    clip = db.one(f"SELECT {columns} FROM clips c LEFT JOIN jobs j ON j.id = c.job_id "
+                  f"WHERE c.id = ?{scope}", (clip_id, *extra))
+    if not clip:
+        raise fail(404, "That clip does not exist.")
+    return clip
+
+
+def _owner_of_job(job_id: str) -> str | None:
+    row = db.one("SELECT user_id FROM jobs WHERE id = ?", (job_id,))
+    return row["user_id"] if row else None
+
+
+def _check_quota(request: Request) -> None:
+    if _is_admin(request):
+        return
+    busy = db.one("SELECT COUNT(*) AS n FROM jobs WHERE user_id = ? AND kind IN ('auto','video','more','live') "
+                  "AND status IN ('queued','running','stopping')", (_user_id(request),))["n"]
+    if busy >= MAX_ACTIVE_JOBS:
+        raise fail(429, f"You already have {MAX_ACTIVE_JOBS} videos in progress. "
+                        "Wait for one to finish, then add the next.")
+
+
 def queue_job(kind: str, *, url: str | None = None, options: dict | None = None,
-              payload: dict | None = None, title: str | None = None) -> dict[str, Any]:
+              payload: dict | None = None, title: str | None = None,
+              user_id: str | None = None) -> dict[str, Any]:
     job = {"id": db.new_id(), "kind": kind, "url": url, "status": "queued", "step": "Queued",
            "progress": 0, "title": title, "options": options or {}, "payload": payload or {},
-           "created_at": time.time(), "updated_at": time.time()}
+           "created_at": time.time(), "updated_at": time.time(), "user_id": user_id}
     db.insert("jobs", job)
     ensure_worker()
     return job
@@ -250,8 +318,15 @@ async def ping() -> dict[str, bool]:
     return {"ok": True}
 
 
+def _youtube_status(request: Request) -> dict[str, Any]:
+    status = youtube.status()
+    if not _is_admin(request):
+        status["auth_url"] = ""  # the owner's sign-in link is for the owner
+    return status
+
+
 @app.get("/api/system")
-def system() -> dict[str, Any]:
+def system(request: Request) -> dict[str, Any]:
     settings = db.get_settings()
     provider = settings["ai"]["provider"]
     secret_name = config.PROVIDER_SECRET.get(provider)
@@ -260,17 +335,19 @@ def system() -> dict[str, Any]:
         "provider": provider,
         "model": settings["ai"]["models"].get(provider),
         "ai_ready": True if secret_name is None else bool(config.secret(secret_name)),
-        "youtube": youtube.status(),
+        "youtube": _youtube_status(request),
     }
 
 
 @app.post("/api/system/start-worker")
-def start_worker() -> dict[str, bool]:
+def start_worker(request: Request) -> dict[str, bool]:
+    _require_admin(request, "Only the owner of this app can restart the worker.")
     return {"started": ensure_worker()}
 
 
 @app.post("/api/ai/test")
-def ai_test() -> dict[str, Any]:
+def ai_test(request: Request) -> dict[str, Any]:
+    _require_admin(request, "Only the owner of this app can test the AI connection.")
     try:
         return llm.ping()
     except llm.LLMError as exc:
@@ -279,11 +356,12 @@ def ai_test() -> dict[str, Any]:
 
 # ---- jobs ------------------------------------------------------------------
 @app.get("/api/jobs")
-def list_jobs(kind: str | None = None) -> list[dict[str, Any]]:
+def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
+    scope, extra = _visible(request)
     rows = db.query(
         "SELECT j.*, (SELECT COUNT(*) FROM clips c WHERE c.job_id = j.id AND c.status = 'ready') "
-        "AS clip_count FROM jobs j WHERE j.kind IN ('auto','video','live') "
-        "ORDER BY j.created_at DESC LIMIT 200")
+        f"AS clip_count FROM jobs j WHERE j.kind IN ('auto','video','live'){scope} "
+        "ORDER BY j.created_at DESC LIMIT 200", extra)
     newest_more: dict[str, dict[str, Any]] = {}
     for item in db.query("SELECT id, status, step, progress, error, payload, created_at FROM jobs "
                          "WHERE kind = 'more' ORDER BY created_at"):
@@ -300,17 +378,21 @@ def list_jobs(kind: str | None = None) -> list[dict[str, Any]]:
 
 
 @app.post("/api/jobs", status_code=201)
-def create_job(body: JobCreate) -> dict[str, Any]:
+def create_job(body: JobCreate, request: Request) -> dict[str, Any]:
     url = body.url.strip()
     if not re.match(r"^https?://[^\s]+$", url):
         raise fail(422, "Paste a full link that starts with https://")
     allowed = {k: body.options[k] for k in ("clip", "format", "captions", "overlay", "live", "max_minutes")
                if k in body.options}
-    options = config.deep_merge(db.get_settings(), allowed)
+    options = config.deep_merge(db.settings_for(_user_id(request)), allowed)
     clip = options["clip"]
     if clip["min_sec"] > clip["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
-    job = queue_job("auto", url=url, options=options)
+    _check_quota(request)
+    if not _is_admin(request):
+        options["max_minutes"] = min(int(options.get("max_minutes") or MAX_MINUTES_FOR_GUESTS),
+                                     MAX_MINUTES_FOR_GUESTS)
+    job = queue_job("auto", url=url, options=options, user_id=_user_id(request))
     job.pop("options")
     return job
 
@@ -321,10 +403,10 @@ class MoreClips(BaseModel):
 
 
 @app.post("/api/jobs/{job_id}/more", status_code=201)
-def more_clips(job_id: str, body: MoreClips) -> dict[str, Any]:
+def more_clips(job_id: str, body: MoreClips, request: Request) -> dict[str, Any]:
     """Find more clips in a video that has already been clipped."""
-    job = db.one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if not job or job["kind"] != "video":
+    job = _job_for(request, job_id)
+    if job["kind"] != "video":
         raise fail(404, "That video does not exist.")
     if job["status"] != "done":
         raise fail(409, "Wait until this video has finished processing.")
@@ -335,16 +417,15 @@ def more_clips(job_id: str, body: MoreClips) -> dict[str, Any]:
     for running in db.query("SELECT payload FROM jobs WHERE kind = 'more' AND status IN ('queued','running','stopping')"):
         if (running["payload"] or {}).get("source_job_id") == job_id:
             raise fail(409, "More clips are already being made from this video.")
-    created = queue_job("more", title=job["title"], payload={
+    _check_quota(request)
+    created = queue_job("more", title=job["title"], user_id=job["user_id"], payload={
         "source_job_id": job_id, "count": body.count, "label_part": body.label_part})
     return {"id": created["id"], "status": created["status"]}
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
-    job = db.one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if not job:
-        raise fail(404, "That job does not exist.")
+def get_job(job_id: str, request: Request) -> dict[str, Any]:
+    job = _job_for(request, job_id)
     job.pop("options", None)
     job["clips"] = [clip_out(c) for c in db.query(
         "SELECT * FROM clips WHERE job_id = ? ORDER BY COALESCE(panel_score, ai_score, 0) DESC", (job_id,))]
@@ -352,10 +433,8 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/jobs/{job_id}/stop")
-def stop_job(job_id: str) -> dict[str, str]:
-    job = db.one("SELECT kind, status FROM jobs WHERE id = ?", (job_id,))
-    if not job:
-        raise fail(404, "That job does not exist.")
+def stop_job(job_id: str, request: Request) -> dict[str, str]:
+    job = _job_for(request, job_id, "j.kind, j.status")
     if job["status"] not in ACTIVE:
         return {"status": job["status"]}
     # A live watch stops cleanly and keeps its clips; anything else is cancelled.
@@ -365,22 +444,19 @@ def stop_job(job_id: str) -> dict[str, str]:
 
 
 @app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: str) -> dict[str, str]:
-    job = db.one("SELECT status FROM jobs WHERE id = ?", (job_id,))
-    if not job:
-        raise fail(404, "That job does not exist.")
+def retry_job(job_id: str, request: Request) -> dict[str, str]:
+    job = _job_for(request, job_id, "j.status")
     if job["status"] not in ("failed", "cancelled"):
         raise fail(409, "Only failed or cancelled jobs can be retried.")
+    _check_quota(request)
     db.update("jobs", job_id, status="queued", step="Queued", error=None)
     ensure_worker()
     return {"status": "queued"}
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
-def delete_job(job_id: str) -> None:
-    job = db.one("SELECT status FROM jobs WHERE id = ?", (job_id,))
-    if not job:
-        raise fail(404, "That job does not exist.")
+def delete_job(job_id: str, request: Request) -> None:
+    job = _job_for(request, job_id, "j.status")
     if job["status"] in ("running", "stopping"):
         raise fail(409, "Stop the job before deleting it.")
     for stored in db.query("SELECT file, thumb FROM clips WHERE job_id = ?", (job_id,)):
@@ -393,29 +469,26 @@ def delete_job(job_id: str) -> None:
 
 # ---- clips -----------------------------------------------------------------
 @app.get("/api/clips")
-def list_clips(job_id: str | None = None) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM clips"
-    params: tuple = ()
+def list_clips(request: Request, job_id: str | None = None) -> list[dict[str, Any]]:
+    scope, extra = _visible(request)
+    sql = f"SELECT c.* FROM clips c LEFT JOIN jobs j ON j.id = c.job_id WHERE 1 = 1{scope}"
+    params = extra
     if job_id:
-        sql, params = sql + " WHERE job_id = ?", (job_id,)
-    return [clip_out(c) for c in db.query(sql + " ORDER BY created_at DESC LIMIT 500", params)]
+        sql, params = sql + " AND c.job_id = ?", (*extra, job_id)
+    return [clip_out(c) for c in db.query(sql + " ORDER BY c.created_at DESC LIMIT 500", params)]
 
 
 @app.get("/api/clips/{clip_id}")
-def get_clip(clip_id: str) -> dict[str, Any]:
-    clip = db.one("SELECT * FROM clips WHERE id = ?", (clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+def get_clip(clip_id: str, request: Request) -> dict[str, Any]:
+    clip = _clip_for(request, clip_id)
     out = clip_out(clip)
     out["posts"] = db.query("SELECT * FROM posts WHERE clip_id = ? ORDER BY created_at DESC", (clip_id,))
     return out
 
 
 @app.patch("/api/clips/{clip_id}")
-def patch_clip(clip_id: str, body: ClipPatch) -> dict[str, Any]:
-    clip = db.one("SELECT * FROM clips WHERE id = ?", (clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+def patch_clip(clip_id: str, body: ClipPatch, request: Request) -> dict[str, Any]:
+    clip = _clip_for(request, clip_id)
     values: dict[str, Any] = {
         k: v for k, v in body.model_dump(include={"title", "hook", "description", "hashtags"}).items()
         if v is not None
@@ -438,16 +511,14 @@ def patch_clip(clip_id: str, body: ClipPatch) -> dict[str, Any]:
             raise fail(409, "This clip is already rendering.")
         db.update("clips", clip_id, status="rendering", created_at=time.time())
         queue_job("render", payload={"clip_id": clip_id, "rescore": body.rescore},
-                  title=values.get("title") or clip["title"])
-    return get_clip(clip_id)
+                  title=values.get("title") or clip["title"], user_id=_owner_of_job(clip["job_id"]))
+    return get_clip(clip_id, request)
 
 
 @app.post("/api/clips/{clip_id}/hooks")
-def suggest_clip_hooks(clip_id: str) -> dict[str, list[str]]:
+def suggest_clip_hooks(clip_id: str, request: Request) -> dict[str, list[str]]:
     """Alternative on-screen hooks for a clip, written from what is said in it."""
-    clip = db.one("SELECT * FROM clips WHERE id = ?", (clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+    clip = _clip_for(request, clip_id)
     opts = clip["options"] or {}
     spoken = ""
     transcript = config.DATA / opts.get("words", "")
@@ -465,10 +536,8 @@ def suggest_clip_hooks(clip_id: str) -> dict[str, list[str]]:
 
 
 @app.delete("/api/clips/{clip_id}", status_code=204)
-def delete_clip(clip_id: str) -> None:
-    clip = db.one("SELECT file, thumb FROM clips WHERE id = ?", (clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+def delete_clip(clip_id: str, request: Request) -> None:
+    clip = _clip_for(request, clip_id, "c.file, c.thumb")
     for key in ("file", "thumb"):
         if storage.is_remote(clip[key]):
             storage.delete(clip[key])
@@ -477,9 +546,9 @@ def delete_clip(clip_id: str) -> None:
     db.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
 
 
-def _serve_file(clip_id: str, column: str, *, download_as: str | None = None):
-    clip = db.one(f"SELECT title, {column} AS ref FROM clips WHERE id = ?", (clip_id,))
-    if not clip or not clip["ref"]:
+def _serve_file(request: Request, clip_id: str, column: str, *, download_as: str | None = None):
+    clip = _clip_for(request, clip_id, f"c.title, c.{column} AS ref")
+    if not clip["ref"]:
         raise fail(404, "The clip file is missing.")
     if storage.is_remote(clip["ref"]):
         try:
@@ -495,26 +564,25 @@ def _serve_file(clip_id: str, column: str, *, download_as: str | None = None):
 
 
 @app.get("/api/clips/{clip_id}/file")
-def clip_file(clip_id: str):
-    return _serve_file(clip_id, "file")
+def clip_file(clip_id: str, request: Request):
+    return _serve_file(request, clip_id, "file")
 
 
 @app.get("/api/clips/{clip_id}/thumb")
-def clip_thumb(clip_id: str):
-    return _serve_file(clip_id, "thumb")
+def clip_thumb(clip_id: str, request: Request):
+    return _serve_file(request, clip_id, "thumb")
 
 
 @app.get("/api/clips/{clip_id}/download")
-def download_clip(clip_id: str):
-    clip = db.one("SELECT title FROM clips WHERE id = ?", (clip_id,))
-    if not clip:
-        raise fail(404, "That clip does not exist.")
+def download_clip(clip_id: str, request: Request):
+    clip = _clip_for(request, clip_id, "c.title")
     name = re.sub(r'[\\/:*?"<>|]+', "", clip["title"] or "clip").strip()[:80] or "clip"
-    return _serve_file(clip_id, "file", download_as=f"{name}.mp4")
+    return _serve_file(request, clip_id, "file", download_as=f"{name}.mp4")
 
 
 @app.post("/api/storage/migrate", status_code=202)
-def storage_migrate() -> dict[str, Any]:
+def storage_migrate(request: Request) -> dict[str, Any]:
+    _require_admin(request, "Only the owner of this app can move stored clips.")
     if not storage.enabled():
         raise fail(409, "Storage is not set up. Add the storage keys and bucket to backend/.env.")
     running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'migrate' AND status IN ('queued','running')")
@@ -524,7 +592,8 @@ def storage_migrate() -> dict[str, Any]:
 
 
 @app.post("/api/storage/test")
-def storage_test() -> dict[str, Any]:
+def storage_test(request: Request) -> dict[str, Any]:
+    _require_admin(request, "Only the owner of this app can test storage.")
     try:
         return storage.check()
     except storage.StorageError as exc:
@@ -535,32 +604,48 @@ def storage_test() -> dict[str, Any]:
 HIDDEN_SETTINGS = ("storage",)  # server-side configuration, not part of the user's settings
 
 
-def _public_settings() -> dict[str, Any]:
-    return {k: v for k, v in db.get_settings().items() if k not in HIDDEN_SETTINGS}
+def _public_settings(request: Request) -> dict[str, Any]:
+    return {k: v for k, v in db.settings_for(_user_id(request) if not _is_admin(request) else None).items()
+            if k not in HIDDEN_SETTINGS}
+
+
+def _secret_view(request: Request) -> dict[str, Any]:
+    status = config.secret_status()
+    if _is_admin(request):
+        return status
+    return {name: {"set": item["set"], "hint": ""} for name, item in status.items()}  # no key fragments
 
 
 @app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
-    return {"settings": _public_settings(), "secrets": config.secret_status()}
+def get_settings(request: Request) -> dict[str, Any]:
+    return {"settings": _public_settings(request), "secrets": _secret_view(request)}
 
 
 @app.put("/api/settings")
-def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
+def put_settings(patch: dict[str, Any], request: Request) -> dict[str, Any]:
+    owner = _is_admin(request)
+    # The owner edits the app-wide settings. Everyone else edits only their own copy of the
+    # clip, format, caption, overlay and live choices.
+    editable = config.DEFAULT_SETTINGS if owner else db.USER_SETTINGS
     allowed = {k: v for k, v in patch.items()
-               if k in config.DEFAULT_SETTINGS and k not in HIDDEN_SETTINGS and isinstance(v, dict)}
-    merged = config.deep_merge(db.get_settings(), allowed)
+               if k in editable and k not in HIDDEN_SETTINGS and isinstance(v, dict)}
+    merged = config.deep_merge(db.settings_for(None if owner else _user_id(request)), allowed)
     if merged["ai"]["provider"] not in config.PROVIDER_SECRET:
         raise fail(422, "Unknown AI provider.")
     if merged["clip"]["min_sec"] > merged["clip"]["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
     if merged["clip"]["min_sec"] < 5 or merged["clip"]["max_sec"] > 180:
         raise fail(422, "Clip length must be between 5 seconds and 3 minutes.")
-    db.save_settings(allowed)
-    return {"settings": _public_settings(), "secrets": config.secret_status()}
+    if owner:
+        db.save_settings(allowed)
+    else:
+        db.save_prefs(_user_id(request), allowed)
+    return {"settings": _public_settings(request), "secrets": _secret_view(request)}
 
 
 @app.put("/api/secrets")
-def put_secret(body: SecretUpdate) -> dict[str, Any]:
+def put_secret(body: SecretUpdate, request: Request) -> dict[str, Any]:
+    _require_admin(request, "Only the owner of this app can change the AI keys.")
     if body.name not in config.PUBLIC_SECRETS:
         raise fail(422, "That key cannot be changed here.")
     try:
@@ -580,7 +665,8 @@ def get_trends() -> dict[str, Any]:
 
 
 @app.post("/api/trends/refresh", status_code=202)
-def refresh_trends() -> dict[str, str]:
+def refresh_trends(request: Request) -> dict[str, str]:
+    _require_admin(request, "Only the owner of this app can refresh trends.")
     running = db.one("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'trends' AND status IN ('queued','running')")
     if not running["n"]:
         queue_job("trends", title="Trend refresh")
@@ -589,8 +675,8 @@ def refresh_trends() -> dict[str, str]:
 
 # ---- YouTube ---------------------------------------------------------------
 @app.get("/api/youtube")
-def youtube_status() -> dict[str, Any]:
-    return youtube.status()
+def youtube_status(request: Request) -> dict[str, Any]:
+    return _youtube_status(request)
 
 
 @app.post("/api/youtube/connect", status_code=202)
@@ -630,7 +716,9 @@ def youtube_disconnect(request: Request) -> dict[str, Any]:
 
 # ---- posts -----------------------------------------------------------------
 @app.get("/api/posts")
-def list_posts() -> list[dict[str, Any]]:
+def list_posts(request: Request) -> list[dict[str, Any]]:
+    if not _is_admin(request):
+        return []  # only the owner posts, to the owner's own channel
     return db.query(
         "SELECT p.*, c.thumb AS thumb, c.panel_score AS panel_score FROM posts p "
         "LEFT JOIN clips c ON c.id = p.clip_id ORDER BY p.created_at DESC LIMIT 300")
@@ -667,7 +755,9 @@ def _with_kind_tag(description: str, kind: str) -> str:
 
 
 @app.post("/api/posts", status_code=201)
-def create_post(body: PostCreate) -> dict[str, Any]:
+def create_post(body: PostCreate, request: Request) -> dict[str, Any]:
+    _require_admin(request, "Only the owner of this app can post to the connected YouTube channel. "
+                            "Download your clip and upload it to your own channel.")
     clip = db.one("SELECT * FROM clips WHERE id = ?", (body.clip_id,))
     if not clip:
         raise fail(404, "That clip does not exist.")
@@ -697,21 +787,22 @@ def create_post(body: PostCreate) -> dict[str, Any]:
         "kind": kind,
         "privacy": body.privacy or db.get_settings()["posting"]["privacy"],
         "publish_at": publish_at, "created_at": time.time(), "updated_at": time.time(),
+        "user_id": _user_id(request),
     }
     db.insert("posts", post)
-    queue_job("upload", payload={"post_id": post["id"]}, title=post["title"])
+    queue_job("upload", payload={"post_id": post["id"]}, title=post["title"], user_id=_user_id(request))
     return post
 
 
 @app.delete("/api/posts/{post_id}", status_code=204)
-def delete_post(post_id: str) -> None:
+def delete_post(post_id: str, request: Request) -> None:
     """Removes the record here. It does not delete the video from YouTube."""
+    _require_admin(request, "Only the owner of this app can remove posts.")
     db.execute("DELETE FROM posts WHERE id = ?", (post_id,))
 
 
 # ---- static: clip files and the built dashboard ----------------------------
 config.ensure_dirs()
-app.mount("/media", StaticFiles(directory=config.JOBS_DIR), name="media")
 if (config.BACKEND / "assets" / "fonts").is_dir():  # caption fonts, for the Settings preview
     app.mount("/fonts", StaticFiles(directory=config.BACKEND / "assets" / "fonts"), name="fonts")
 if config.FRONTEND_DIST.exists():

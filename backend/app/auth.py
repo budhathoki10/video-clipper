@@ -62,16 +62,15 @@ def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
                 if by_email is not None and by_email["google_sub"] not in (None, "", subject):
                     raise AuthError("That email is already linked to another Google account.")
                 row = by_email
+            owners = config.admin_emails()
             if row is None:
-                if config.public_url() and not allowed:
-                    raise AuthError("Sign-up is closed. The owner must add ALLOWED_EMAILS to the "
-                                    "server settings first.")
                 first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+                is_admin = email in owners if owners else first
                 user_id = db.new_id()
                 conn.execute(
                     "INSERT INTO users (id, email, name, password_hash, google_sub, avatar_url, "
                     "is_admin, created_at, last_login_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?)",
-                    (user_id, email, name, subject, avatar, int(first), now, now),
+                    (user_id, email, name, subject, avatar, int(is_admin), now, now),
                 )
             else:
                 user_id = row["id"]
@@ -80,6 +79,8 @@ def upsert_google_user(claims: dict[str, Any]) -> dict[str, Any]:
                     "last_login_at = ? WHERE id = ?",
                     (email, name, subject, avatar, now, user_id),
                 )
+                if owners:  # when owners are named, that list decides who is one
+                    conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (int(email in owners), user_id))
             conn.commit()
         except Exception:
             conn.rollback()
