@@ -904,3 +904,11 @@ def test_hosted_routes_use_the_public_address_and_only_the_owner_can_change_yout
     db.kv_set("youtube", {})
     db.execute("DELETE FROM sessions")
     db.execute("DELETE FROM users")
+
+
+def test_render_supplies_the_public_address_itself(monkeypatch):
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://clipper-abc.onrender.com")
+    assert config.public_url() == "https://clipper-abc.onrender.com"
+    monkeypatch.setenv("PUBLIC_URL", "https://clips.example.com/")
+    assert config.public_url() == "https://clips.example.com", "an explicit PUBLIC_URL (custom domain) wins"

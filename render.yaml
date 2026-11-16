@@ -1,0 +1,49 @@
+# Render Blueprint: one Docker web service that runs the dashboard, the API and the background
+# worker. Create it in Render with New > Blueprint and pick this repository. Step by step:
+# docs/DEPLOY_RENDER.md
+#
+# Values marked `sync: false` are asked for in the Render dashboard the first time. They are never
+# stored in this file or in the repository.
+services:
+  - type: web
+    name: clipper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # A persistent disk needs a paid plan, and rendering needs about 2 GB of memory. The free plan
+    # sleeps, has no disk (the database and your YouTube connection are erased on every restart)
+    # and is too small for video work.
+    plan: standard
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: clipper-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      # Where jobs, the database and the YouTube token live (the disk above).
+      - key: CLIPPER_DATA_DIR
+        value: /data
+      # Who may sign in: comma-separated Google emails. With this empty nobody can create an
+      # account, so set it to your own address before the first sign-in.
+      - key: ALLOWED_EMAILS
+        sync: false
+      # Google "Web application" OAuth client: used for the app sign-in and for connecting YouTube.
+      - key: GOOGLE_LOGIN_CLIENT_ID
+        sync: false
+      - key: GOOGLE_LOGIN_CLIENT_SECRET
+        sync: false
+      # AI engine key (NVIDIA is the default). Add the others only if you use them.
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # Where finished clips are kept.
+      - key: BLOMP_ACCESS_KEY_ID
+        sync: false
+      - key: BLOMP_SECRET_ACCESS_KEY
+        sync: false
+      - key: BLOMP_BUCKET
+        sync: false
