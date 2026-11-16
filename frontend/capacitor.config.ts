@@ -5,6 +5,7 @@ import type { CapacitorConfig } from "@capacitor/cli";
 const config: CapacitorConfig = {
   appId: "app.clipper.mobile",
   appName: "Clipper",
+  //It means: “Put the website generated in out inside the mobile application.”
   webDir: "out",
   ios: {
     contentInset: "never", // the page handles the safe areas itself (viewport-fit=cover)
