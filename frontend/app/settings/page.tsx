@@ -91,7 +91,12 @@ function YouTubeConnect() {
     setBusy(name);
     setError(null);
     try {
-      await api(path, { method: "POST", json: body });
+      const result = await api<{ redirect_to?: string } | undefined>(path, { method: "POST", json: body });
+      if (result?.redirect_to) {
+        // Hosted: Google sends the browser back to this page after the sign-in.
+        window.location.assign(result.redirect_to);
+        return true;
+      }
       if (done) toast(done);
       await yt.reload();
       return true;

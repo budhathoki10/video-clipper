@@ -826,3 +826,81 @@ def test_a_hosted_app_without_an_allow_list_keeps_sign_up_closed(monkeypatch):
     monkeypatch.delenv("PUBLIC_URL")
     assert auth.upsert_google_user({"sub": "s9", "email": "a@example.com", "email_verified": True})["is_admin"]
     db.execute("DELETE FROM users")
+
+
+def test_hosted_youtube_connect_uses_a_web_redirect_and_checks_state(monkeypatch, tmp_path):
+    from google_auth_oauthlib.flow import Flow
+
+    from app import youtube
+
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_ID", "web-client.example")
+    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_SECRET", "web-secret-for-test")
+    monkeypatch.setattr(youtube, "TOKEN_FILE", tmp_path / "token.json")
+    db.kv_set("youtube", {})
+    assert youtube.hosted() and youtube.client_configured()
+
+    url = youtube.start_web_connect()
+    assert "redirect_uri=https%3A%2F%2Fclipper.example.com%2Fapi%2Fyoutube%2Fcallback" in url
+    assert "code_challenge=" in url and "access_type=offline" in url
+    state = db.kv_get("youtube")["state"]
+    assert youtube.status()["connecting"] is True and youtube.status()["auth_url"] == url
+
+    with pytest.raises(youtube.YouTubeError, match="expired"):
+        youtube.finish_web_connect("some-other-state", "code")
+
+    class Credentials:
+        def to_json(self):
+            return '{"token": "t"}'
+
+    seen = {}
+
+    def fake_fetch(self, code=None, **kwargs):
+        seen["code"], seen["verifier"] = code, self.code_verifier
+
+    monkeypatch.setattr(Flow, "fetch_token", fake_fetch)
+    monkeypatch.setattr(Flow, "credentials", property(lambda self: Credentials()))
+    monkeypatch.setattr(youtube, "_service", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+    youtube.finish_web_connect(state, "the-code")
+    assert seen["code"] == "the-code" and seen["verifier"], "the code is exchanged with the stored PKCE verifier"
+    assert (tmp_path / "token.json").exists() and youtube.status()["connected"] is True
+    assert youtube.status()["connecting"] is False
+    db.kv_set("youtube", {})
+
+
+def test_hosted_routes_use_the_public_address_and_only_the_owner_can_change_youtube(monkeypatch):
+    from app import auth
+
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    monkeypatch.setenv("ALLOWED_EMAILS", "owner@example.com,friend@example.com")
+    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_ID", "web-client.example")
+    monkeypatch.setenv("GOOGLE_LOGIN_CLIENT_SECRET", "web-secret-for-test")
+    asked = {}
+    monkeypatch.setattr(auth, "google_authorization_url",
+                        lambda source, redirect: asked.setdefault("redirect", redirect) and "https://accounts.google.test/x")
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
+    owner = auth.upsert_google_user({"sub": "o1", "email": "owner@example.com", "email_verified": True})
+    friend = auth.upsert_google_user({"sub": "f1", "email": "friend@example.com", "email_verified": True})
+    db.kv_set("youtube", {})
+
+    with TestClient(app) as browser:
+        browser.get("/api/auth/google", follow_redirects=False)
+        assert asked["redirect"] == "https://clipper.example.com/api/auth/google/callback", \
+            "behind a hosting proxy the sign-in must return to the public address"
+
+        browser.cookies.set(auth.SESSION_COOKIE, auth.create_session(friend["id"]))
+        assert browser.post("/api/youtube/connect").status_code == 403
+        assert browser.post("/api/youtube/disconnect").status_code == 403
+        assert browser.get("/api/youtube/callback?code=x&state=y", follow_redirects=False).status_code == 403
+
+        browser.cookies.set(auth.SESSION_COOKIE, auth.create_session(owner["id"]))
+        cancelled = browser.get("/api/youtube/callback?error=access_denied", follow_redirects=False)
+        assert cancelled.status_code == 303 and cancelled.headers["location"] == "/settings/#youtube"
+        assert "cancelled" in browser.get("/api/youtube").json()["error"]
+        started = browser.post("/api/youtube/connect")
+        assert started.status_code == 202 and started.json()["redirect_to"].startswith("https://accounts.google.com/")
+    db.kv_set("youtube", {})
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
