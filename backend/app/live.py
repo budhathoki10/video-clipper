@@ -150,7 +150,7 @@ class LiveSession:
             peak, self.pending = self.pending, None
             if chosen:
                 # Copy now: the segment files are deleted once they age out.
-                self.pool.submit(self._safe_window, chosen, peak)
+                self.pool.submit(runner._in_context(self._safe_window), chosen, peak)
         fresh = entry["t0"] - self.last_trigger >= float(self.cfg["cooldown_sec"])
         if not self.pending and fresh and len(self.history) > WARMUP_SEGMENTS \
                 and entry["score"] >= float(self.cfg["sensitivity"]):
@@ -201,7 +201,7 @@ class LiveSession:
         next_index, restarts, stopping = 0, 0, False
         try:
             while True:
-                row = db.one("SELECT status FROM jobs WHERE id = ?", (self.job_id,))
+                row = db.find_one("jobs", {"id": self.job_id})
                 stopping = not row or row["status"] in ("stopping", "cancelled")
                 if stopping and recorder.poll() is None:
                     recorder.terminate()

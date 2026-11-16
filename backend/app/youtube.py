@@ -1,20 +1,23 @@
-"""YouTube channel connection: sign-in, upload now or scheduled, view counts.
+"""YouTube channel connection: each person connects their own channel, then posts to it.
 
-The OAuth client ID and secret come from backend/.env. The saved user token
-stays in data/tokens/ (gitignored). None is ever returned by the API.
+Sign-in is a normal web redirect: the person goes to Google, allows uploads, and Google sends the
+browser back to /api/youtube/callback on this app. The one-time state and PKCE verifier are kept in
+the database for 10 minutes. The channel token is encrypted before it is stored (see keys.py) and
+is never returned by the API.
+
+The OAuth client ID and secret are the server's (backend/.env or the host's environment). Uploads
+count against that Google project's daily quota, which is shared by everyone who uses the app.
 """
 from __future__ import annotations
 
 import hmac
-import os
-import threading
+import json
 import time
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, db
+from . import config, db, keys
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube.readonly"]
@@ -25,118 +28,102 @@ CATEGORY_IDS = {
     "Comedy": "23", "Entertainment": "24", "News & Politics": "25", "Howto & Style": "26",
     "Education": "27", "Science & Technology": "28",
 }
-TOKEN_FILE = config.TOKENS_DIR / "youtube_token.json"
-_connect_lock = threading.Lock()
+CONNECT_SECONDS = 600
 
 
 class YouTubeError(RuntimeError):
     """Raised with a message that is safe to show to the user."""
 
 
-_BROWSER_NAME = "clipper-sign-in"
-
-
-class _OpenAndRemember(webbrowser.BaseBrowser):
-    """Opens the Google page and also keeps its address, so the dashboard can
-    show a link when a background process could not put the page on screen."""
-
-    def open(self, url: str, new: int = 0, autoraise: bool = True) -> bool:
-        db.kv_set("youtube", {"auth_url": url})
-        try:
-            if os.name == "nt":
-                os.startfile(url)  # noqa: S606 - the address comes from Google's own client library
-            else:
-                webbrowser.open(url)
-        except Exception:
-            pass
-        return True
-
-
-WEB_CONNECT_SECONDS = 600
-
-
-def hosted() -> bool:
-    """A hosted app cannot use the local sign-in (Google redirects to this computer's
-    own address). It uses a normal web redirect to PUBLIC_URL instead."""
-    return bool(config.public_url())
-
-
-def _web_pending(state: dict[str, Any]) -> bool:
-    return bool(state.get("state")) and time.time() < state.get("expires", 0)
-
-
-def status() -> dict[str, Any]:
-    state = db.kv_get("youtube", {}) or {}
-    waiting = _connect_lock.locked() or (hosted() and _web_pending(state))
-    return {
-        "auth_url": state.get("auth_url", "") if waiting else "",
-        "client_configured": client_configured(),
-        "connected": TOKEN_FILE.exists(),
-        "channel": state.get("channel", "") if TOKEN_FILE.exists() else "",
-        "connecting": waiting,
-        "error": state.get("error", ""),
-    }
+def _state_key(user_id: str) -> str:
+    return f"youtube-connect:{user_id}"
 
 
 def client_configured() -> bool:
-    # Hosted: the Web application client that also does the app sign-in. Local: the Desktop client.
-    return (config.google_login_oauth_client() if hosted() else config.google_oauth_client()) is not None
+    return config.google_login_oauth_client() is not None
 
 
-def web_redirect_uri() -> str:
-    return f"{config.public_url()}/api/youtube/callback"
+def status(user_id: str) -> dict[str, Any]:
+    pending = db.kv_get(_state_key(user_id), {}) or {}
+    waiting = bool(pending.get("state")) and time.time() < pending.get("expires", 0)
+    channel = keys.youtube_channel(user_id)
+    return {
+        "auth_url": pending.get("auth_url", "") if waiting else "",
+        "client_configured": client_configured(),
+        "connected": channel is not None,
+        "channel": channel or "",
+        "connecting": waiting,
+        "error": pending.get("error", ""),
+    }
 
 
-def start_web_connect() -> str:
-    """Hosted sign-in, step 1: the Google page to send the browser to. The one-time state and
-    PKCE verifier are kept server-side until Google sends the browser back."""
+def callback_uri(base: str) -> str:
+    return f"{base.rstrip('/')}/api/youtube/callback"
+
+
+def start_connect(user_id: str, base: str) -> str:
+    """Step 1: the Google page to send this person's browser to."""
     from google_auth_oauthlib.flow import Flow
 
     oauth_config = config.google_login_oauth_client()
     if oauth_config is None:
-        raise YouTubeError("Google OAuth is not configured on the server. Set GOOGLE_LOGIN_CLIENT_ID "
-                           "and GOOGLE_LOGIN_CLIENT_SECRET.")
-    flow = Flow.from_client_config(oauth_config, SCOPES, redirect_uri=web_redirect_uri())
+        raise YouTubeError("Posting to YouTube is not set up on this server yet. "
+                           "The server owner must add the Google OAuth client.")
+    flow = Flow.from_client_config(oauth_config, SCOPES, redirect_uri=callback_uri(base))
     url, state = flow.authorization_url(access_type="offline", prompt="consent")
-    db.kv_set("youtube", {"auth_url": url, "state": state, "verifier": flow.code_verifier,
-                          "expires": time.time() + WEB_CONNECT_SECONDS})
+    db.kv_set(_state_key(user_id), {"auth_url": url, "state": state, "verifier": flow.code_verifier,
+                                    "redirect_uri": callback_uri(base),
+                                    "expires": time.time() + CONNECT_SECONDS})
     return url
 
 
-def finish_web_connect(state: str, code: str) -> None:
-    """Hosted sign-in, step 2: exchange Google's code for the channel token."""
+def finish_connect(user_id: str, state: str, code: str) -> None:
+    """Step 2: exchange Google's code for this person's channel token and save it."""
     from google_auth_oauthlib.flow import Flow
 
-    saved = db.kv_get("youtube", {}) or {}
-    if not (_web_pending(saved) and state and hmac.compare_digest(str(saved["state"]), state)):
+    saved = db.kv_get(_state_key(user_id), {}) or {}
+    pending = bool(saved.get("state")) and time.time() < saved.get("expires", 0)
+    if not (pending and state and hmac.compare_digest(str(saved["state"]), state)):
         raise YouTubeError("That sign-in link expired. Press Connect YouTube again.")
     oauth_config = config.google_login_oauth_client()
     if oauth_config is None:
-        raise YouTubeError("Google OAuth is not configured on the server.")
-    flow = Flow.from_client_config(oauth_config, SCOPES, state=state, redirect_uri=web_redirect_uri())
+        raise YouTubeError("Posting to YouTube is not set up on this server yet.")
+    flow = Flow.from_client_config(oauth_config, SCOPES, state=state, redirect_uri=saved["redirect_uri"])
     flow.code_verifier = saved.get("verifier")
     try:
         flow.fetch_token(code=code)
     except Exception as exc:
-        db.kv_set("youtube", {})
+        db.kv_delete(_state_key(user_id))
         raise YouTubeError(f"Google did not accept the sign-in: {str(exc)[:160]}") from None
-    TOKEN_FILE.write_text(flow.credentials.to_json(), encoding="utf-8")
+    token_json = flow.credentials.to_json()
+    keys.save_youtube(user_id, token_json, "")
     channel = ""
     try:
-        items = _service().channels().list(part="snippet", mine=True).execute().get("items", [])
+        items = _service(user_id).channels().list(part="snippet", mine=True).execute().get("items", [])
         channel = items[0]["snippet"]["title"] if items else ""
     except Exception:
         pass
-    db.kv_set("youtube", {"channel": channel})
+    keys.save_youtube(user_id, keys.load_youtube(user_id)[0], channel)
+    db.kv_delete(_state_key(user_id))
 
 
-def _credentials():
+def record_error(user_id: str, message: str) -> None:
+    db.kv_set(_state_key(user_id), {"error": message})
+
+
+def disconnect(user_id: str) -> None:
+    keys.delete_youtube(user_id)
+    db.kv_delete(_state_key(user_id))
+
+
+def _credentials(user_id: str):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
-    if not TOKEN_FILE.exists():
-        raise YouTubeError("No YouTube channel is connected. Connect one in Settings.")
-    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    saved = keys.load_youtube(user_id)
+    if not saved:
+        raise YouTubeError("Connect your YouTube channel in Settings before posting.")
+    creds = Credentials.from_authorized_user_info(json.loads(saved[0]), SCOPES)
     if not creds.valid:
         if not creds.refresh_token:
             raise YouTubeError("The YouTube sign-in expired. Connect the channel again in Settings.")
@@ -144,65 +131,20 @@ def _credentials():
             creds.refresh(Request())
         except Exception:
             raise YouTubeError("The YouTube sign-in expired. Connect the channel again in Settings.") from None
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        keys.save_youtube(user_id, creds.to_json(), saved[1])
     return creds
 
 
-def _service():
+def _service(user_id: str):
     from googleapiclient.discovery import build
 
-    return build("youtube", "v3", credentials=_credentials(), cache_discovery=False)
-
-
-def connect_in_background() -> None:
-    """Open Google's consent page in the browser and wait for the sign-in."""
-    oauth_config = config.google_oauth_client()
-    if oauth_config is None:
-        raise YouTubeError("Google OAuth is not configured. Add GOOGLE_CLIENT_ID and "
-                           "GOOGLE_CLIENT_SECRET to backend/.env.")
-    if not _connect_lock.acquire(blocking=False):
-        return
-
-    def work() -> None:
-        try:
-            from google_auth_oauthlib.flow import InstalledAppFlow
-
-            db.kv_set("youtube", {})
-            webbrowser.register(_BROWSER_NAME, None, _OpenAndRemember())
-            flow = InstalledAppFlow.from_client_config(oauth_config, SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=True, browser=_BROWSER_NAME,
-                                          timeout_seconds=600,
-                                          authorization_prompt_message="",
-                                          success_message="Channel connected. You can close this tab.")
-            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-            channel = ""
-            try:
-                items = _service().channels().list(part="snippet", mine=True).execute().get("items", [])
-                channel = items[0]["snippet"]["title"] if items else ""
-            except Exception:
-                pass
-            db.kv_set("youtube", {"channel": channel})
-        except Exception as exc:
-            timed_out = not str(exc) or "imed out" in str(exc)
-            db.kv_set("youtube", {"error": (
-                "The Google sign-in was not completed within 10 minutes. Press Connect YouTube "
-                "again and finish the Google page that opens." if timed_out
-                else f"Sign-in did not finish: {str(exc)[:200]}")})
-        finally:
-            _connect_lock.release()
-
-    threading.Thread(target=work, daemon=True, name="youtube-connect").start()
-
-
-def disconnect() -> None:
-    TOKEN_FILE.unlink(missing_ok=True)
-    db.kv_set("youtube", {})
+    return build("youtube", "v3", credentials=_credentials(user_id), cache_discovery=False)
 
 
 def _explain(exc: Exception) -> str:
     text = str(exc)
     if "quotaExceeded" in text:
-        return "YouTube's daily upload quota for your Google project is used up. Try again tomorrow."
+        return "YouTube's daily upload limit for this app is used up. Try again tomorrow."
     if "uploadLimitExceeded" in text:
         return "YouTube says this channel has reached its upload limit for today."
     if "youtubeSignupRequired" in text:
@@ -212,10 +154,10 @@ def _explain(exc: Exception) -> str:
     return f"YouTube rejected the upload: {text[:220]}"
 
 
-def upload(*, file: Path, title: str, description: str, tags: list[str], privacy: str,
+def upload(user_id: str, *, file: Path, title: str, description: str, tags: list[str], privacy: str,
            publish_at: str | None, category_id: str,
            on_progress: Callable[[float], None] | None = None) -> str:
-    """Upload a video. With `publish_at` (ISO time) YouTube publishes it then."""
+    """Upload a video to this person's channel. With `publish_at` (ISO time) YouTube publishes it then."""
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
@@ -234,7 +176,7 @@ def upload(*, file: Path, title: str, description: str, tags: list[str], privacy
         "status": video_status,
     }
     try:
-        request = _service().videos().insert(
+        request = _service(user_id).videos().insert(
             part="snippet,status", body=body,
             media_body=MediaFileUpload(str(file), chunksize=8 * 1024 * 1024, resumable=True),
         )
@@ -248,9 +190,9 @@ def upload(*, file: Path, title: str, description: str, tags: list[str], privacy
         raise YouTubeError(_explain(exc)) from None
 
 
-def view_counts(video_ids: list[str]) -> dict[str, int]:
+def view_counts(user_id: str, video_ids: list[str]) -> dict[str, int]:
     out: dict[str, int] = {}
-    service = _service()
+    service = _service(user_id)
     for i in range(0, len(video_ids), 50):
         chunk = video_ids[i:i + 50]
         items = service.videos().list(part="statistics", id=",".join(chunk)).execute().get("items", [])

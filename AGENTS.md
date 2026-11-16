@@ -8,14 +8,15 @@ anything non-trivial). User-facing quick start: `README.md`.
 - `backend/app/main.py` dashboard API (queues jobs, never does heavy work)
 - `backend/app/worker.py` background process that runs jobs; `runner.py` video steps; `live.py` live streams
 - `backend/app/pipeline/` download, transcribe, signals, AI selection, captions, render, panel, trends
-- `backend/app/llm.py` AI providers; `youtube.py` posting; `storage.py` remote storage
+- `backend/app/llm.py` AI providers; `youtube.py` posting; `storage.py` remote storage; `db.py` MongoDB;
+  `keys.py` encrypted per-person keys and YouTube tokens; `auth.py` Google sign-in
 - `frontend/` Next.js dashboard (static export, served by the API); `scripts/` Windows start/stop
 - `backend/tests/test_e2e.py` the tests
 
 ## Commands
 ```
 cd backend
-.venv\Scripts\python -m pytest -m "not network"     # fast checks, ~20 s
+.venv\Scripts\python -m pytest -m "not network"     # fast checks, ~20 s, in-memory database
 .venv\Scripts\python -m pytest                      # full run incl. real video + storage, ~8 min
 cd ..\frontend && npm run build                     # rebuild the dashboard the API serves
 scripts\start.ps1 / scripts\stop.ps1                # run / stop in the background
@@ -27,7 +28,7 @@ Restart with `stop.ps1` then `start.ps1` after backend changes (the worker is a 
    source, tests, docs, logs, API responses or the frontend. Never print a key back. The tests check this.
 2. **Storage is invisible to users.** Clips are held in remote S3-compatible storage (see docs section 9).
    Do not add UI, settings, messages, paths or "free disk" that reveal it. `GET/PUT /api/settings` hide
-   `storage`; clip responses omit `file`/`thumb`.
+   `storage`; clip and job responses omit `file`/`thumb`/`files`.
 3. **Not topic-specific.** The product works for any video. No game, show or channel names in prompts,
    defaults, copy or personas.
 4. **Honest claims.** Scores rank clips; they never promise views. Do not add copy that does.
@@ -44,11 +45,16 @@ Restart with `stop.ps1` then `start.ps1` after backend changes (the worker is a 
 9. **Git.** Do not commit, push or open PRs unless the owner asks. Never add `Co-Authored-By`, "Generated
    with" lines or session links to commits or PRs.
 
-10. **People are separate.** Every job and post has a `user_id`; read and change work only through
-   `_job_for`, `_clip_for` and `_visible` in `main.py` so one person never reaches another's work (a
-   stranger's id returns 404). Keys, the AI engine, storage, the YouTube channel and posting are
-   owner-only (`_require_admin`). New routes that touch jobs, clips, posts or settings must follow
-   this and get a test.
+10. **Everyone is an ordinary user; nothing is shared.** There is no administrator. Every job, clip
+   and post has a `user_id`; read and change work only through `_job_for`, `_clip_for` and `_mine` in
+   `main.py` so one person never reaches another's work (a stranger's id returns 404). Settings, AI
+   keys and the YouTube channel are per person (`db.settings_for`, `keys.py`, `youtube.py`). The only
+   shared secret is the platform `NVIDIA_API_KEY`. Do not add pages or routes that list other people
+   or their work. New routes that touch jobs, clips, posts, keys or settings need a test.
+11. **The server keeps nothing.** Data is in MongoDB (`db.py`; documents have a string `id`), files are
+   in S3-compatible storage (`storage.py`). The job folder under `CLIPPER_DATA_DIR` is scratch space
+   that `runner.persist_job_files` empties when a job finishes. Never add something that must survive
+   on the server's own disk. Keys and tokens are encrypted with `APP_SECRET_KEY` (`keys.py`).
 
 ## Things easy to get wrong
 - Jobs resume from files in `data/jobs/<id>/`; a step must write its result before the next step reads it.

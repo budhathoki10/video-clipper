@@ -2,7 +2,7 @@
 # background worker (the API starts and supervises the worker itself).
 #
 # Build:  docker build -t clipper .
-# Run:    docker run -p 10000:10000 -v clipper-data:/data --env-file backend/.env clipper
+# Run:    docker run -p 10000:10000 --env-file backend/.env clipper
 
 # --- 1. build the dashboard (static export) ---------------------------------------------------
 FROM node:22-slim AS dashboard
@@ -36,7 +36,7 @@ COPY backend/app ./app
 COPY backend/assets ./assets
 COPY --from=dashboard /build/frontend/out /app/frontend/out
 
-# Jobs, the database and the YouTube token live here. Mount a persistent disk on /data.
+# Scratch space for the video being processed. Everything lasting is in MongoDB and the storage.
 RUN mkdir -p /data
 EXPOSE 10000
 

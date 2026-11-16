@@ -2,100 +2,117 @@
 
 One Render service runs everything: the dashboard, the API and the background worker. The repository
 contains the `Dockerfile` and `render.yaml` it needs. Nothing secret is stored in the repository: you
-enter keys in Render's dashboard.
+enter values in Render's dashboard.
+
+## How the pieces fit
+
+The server keeps nothing of its own, so it can be restarted or replaced at any time.
+
+| What | Where it lives |
+|---|---|
+| Video links, jobs, clips (titles, scores), posts, accounts, each person's settings, keys and YouTube connection | **MongoDB** (`MONGODB_URI`) |
+| Downloaded videos, the working files (transcript and so on) and the finished clips | **Blomp storage** (`BLOMP_*`) |
+| Your keys and secrets | Render's Environment tab |
+
+While a video is being processed it sits in a temporary folder on the server. When the job finishes, the
+video and its working files are uploaded to storage and the folder is removed.
 
 ## What to expect
 
-- **Plan.** `render.yaml` asks for the `standard` plan (about 2 GB of memory) with a 10 GB disk. Check
-  Render's current prices. The free plan will not work for this app: it sleeps, it has no disk (the
-  database, sign-ins and the YouTube connection are erased on every restart) and it has too little
-  memory for video work.
-- **Speed.** There is no GPU. Transcription uses the CPU model (`small`) and encoding uses x264, so a
-  long video takes much longer than on a PC with a graphics card.
-- **Downloads.** YouTube often blocks downloads from data-centre addresses. If a job fails with a
-  download error on Render but the same link works on your PC, that is the cause.
-- **Keys changed in Settings** are written to the container, not to Render. They are lost on the next
-  deploy. Change keys in Render's Environment tab.
+- **Plan.** `render.yaml` asks for the `standard` plan (about 2 GB of memory). Check Render's current
+  prices. No disk is needed. The free plan has too little memory for video work and sleeps after a quiet
+  spell.
+- **Speed.** There is no GPU. Transcription uses the CPU model (`small`) and encoding uses x264, so a long
+  video takes much longer than on a PC with a graphics card.
+- **Long videos.** There is no length limit. A long video needs temporary disk space on the server while
+  it is processed; the app refuses to start a download when less than 5 GB is free.
+- **Downloads.** YouTube often blocks downloads from data-centre addresses. If a job fails with a download
+  error on Render but the same link works on your PC, that is the cause.
+- **YouTube quota is shared.** Every upload by every person counts against the daily quota of your Google
+  project (about six uploads a day by default). Ask Google for more quota before many people post.
 
-## 1. Google Cloud (about 5 minutes)
+## Everyone is a user
 
-In the project you already use for sign-in:
+Anyone with a Google account can sign in. There is no administrator and no sign-up list. Each person:
+
+- sees only their own videos, clips, posts and settings;
+- connects **their own** YouTube channel and posts to it (nobody posts to anyone else's channel);
+- uses the shared NVIDIA key by default, and adds **their own** key in Settings to use Claude or Gemini
+  (or their own NVIDIA key). Their keys are encrypted and only used for their clips;
+- can have 3 videos in progress at a time. Their length is not limited.
+
+Nobody, including whoever runs the server, has a page that lists other people or their work.
+
+## 1. MongoDB (about 5 minutes)
+
+1. Create a free cluster on MongoDB Atlas and a database user.
+2. Under *Network Access*, allow `0.0.0.0/0`. Render's outgoing addresses change, so a fixed list does not
+   work. The database user's password is what protects the database, so make it long.
+3. Click *Connect > Drivers* and copy the connection string. It looks like
+   `mongodb+srv://USER:PASSWORD@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority`.
+   Put the real password in place of `PASSWORD`. If the password has special characters (`@ : / ?`), URL
+   encode them.
+
+## 2. Google Cloud (about 5 minutes)
+
+In the project you use for sign-in:
 
 1. Enable **YouTube Data API v3**.
 2. Open the **Web application** OAuth client (the one behind `GOOGLE_LOGIN_CLIENT_ID`) and add two
-   *Authorized redirect URIs*, using your final address (shown by Render after the first deploy, or
-   your custom domain):
+   *Authorized redirect URIs*, using your final address (shown by Render, or your custom domain):
    - `https://YOUR-APP.onrender.com/api/auth/google/callback`
    - `https://YOUR-APP.onrender.com/api/youtube/callback`
-3. Under *Audience*, add your own Google account (and the one that owns the YouTube channel) as test
-   users while the app is in testing mode.
+3. While the app is in testing mode, add every person's Google account as a *test user* (Google allows
+   about 100). To let anyone in, publish the app and complete Google's verification; until then, uploaded
+   videos stay private.
 
-## 2. Create the service
+## 3. Create the service
 
 1. Push the repository to GitHub (done: `main`).
 2. In Render: **New > Blueprint**, choose the repository. Render reads `render.yaml`.
 3. Fill in the values it asks for (see the table). Everything marked secret stays in Render only.
-4. Deploy. The first build takes several minutes (it builds the dashboard and installs Python
-   packages).
+4. Deploy. The first build takes several minutes.
 
 | Variable | What to enter |
 |---|---|
-| `ADMIN_EMAILS` | Your Google email: the owner of the app (comma separated for more than one) |
+| `MONGODB_URI` | The connection string from step 1 |
 | `GOOGLE_LOGIN_CLIENT_ID`, `GOOGLE_LOGIN_CLIENT_SECRET` | From the Web application OAuth client |
-| `NVIDIA_API_KEY` | Your NVIDIA key (or leave empty and use another provider) |
-| `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | Only if you use those providers |
-| `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY`, `BLOMP_BUCKET` | Where finished clips are kept |
+| `NVIDIA_API_KEY` | The shared NVIDIA key every person uses by default |
+| `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY`, `BLOMP_BUCKET` | Where videos and clips are kept |
+| `APP_SECRET_KEY` | Generated by Render. It encrypts people's saved keys and tokens. **Do not change or lose it**, or saved keys can no longer be read |
 
 `PUBLIC_URL` is set automatically from Render's own address (`RENDER_EXTERNAL_URL`). Add a `PUBLIC_URL`
-environment variable yourself only if you use a custom domain.
+environment variable yourself only if you use a custom domain (full address, no trailing slash).
 
-## 3. First sign-in
+## 4. First sign-in
 
-Open the address, press **Continue with Google** and sign in with the address in `ADMIN_EMAILS`. That
-account is the owner. Then open **Settings > Posting > Connect YouTube**. Only an owner can connect or
-disconnect the channel on a hosted app.
+Open the address and press **Continue with Google**. Then, in **Settings > Posting**, press
+**Connect YouTube** to connect your own channel.
 
-**Set `ADMIN_EMAILS` before you tell anyone the address.** Anyone with a Google account can sign in. If
-`ADMIN_EMAILS` is empty, whoever signs in first becomes the owner.
+## 5. Keeping it awake (only on a plan that sleeps)
 
-## Who can use the app
+`GET https://YOUR-APP.onrender.com/api/ping` returns `{"ok": true}`, needs no sign-in and does no work.
+Point an external scheduler at it (for example cron-job.org) every 10 to 14 minutes. This only keeps the
+page awake; it does not give a free instance more memory.
 
-Anyone with a Google account can sign in and make clips. There is no sign-up list. Each person:
-
-- sees, edits and deletes only their own videos and clips, and has their own clip, format and caption
-  settings;
-- can have 2 videos in progress at a time, and videos longer than 90 minutes are cut off;
-- can download their clips.
-
-Only owners can change the AI keys and engine, storage, trends and the YouTube connection, see the user
-list, and **post to the connected YouTube channel**. A guest who tries gets a clear message and is told
-to download the clip. The owner sees everyone's work.
-
-To close the app to named people instead, set `ALLOWED_EMAILS` (comma separated). Anyone else is refused
-at sign-in.
-
-Every guest uses your server's CPU and memory, your AI quota and your storage. The limits above are the
-only controls, so watch your usage if the address spreads.
-
-## 4. Keeping it awake (only if you do not use a paid always-on plan)
-
-`GET https://YOUR-APP.onrender.com/api/ping` returns `{"ok": true}`, needs no sign-in and does no
-work. Point an external scheduler at it (for example cron-job.org). Free instances sleep after about
-15 minutes without traffic, so every 10 to 14 minutes is enough. This only keeps the page awake; it
-does not give a free instance a disk or more memory.
-
-## 5. Phone home screen
+## 6. Phone home screen
 
 Open the address in Safari, choose Share, then **Add to Home Screen**. Sign in again inside the
 home-screen app (it does not share Safari's login).
+
+## Keep your database password safe
+
+If a connection string or password was ever pasted into a chat or a file that is shared, change the
+database user's password in Atlas and update `MONGODB_URI` in Render.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| Google says `redirect_uri_mismatch` | The two redirect URIs in step 1 do not match your address exactly (scheme, host, no trailing slash) |
-| "This email address is not allowed" | `ALLOWED_EMAILS` is set and does not include that email |
-| You are not the owner after signing in | `ADMIN_EMAILS` does not match your Google email exactly |
+| The app does not start; the log says the database is not set up | `MONGODB_URI` is missing, wrong, or Atlas does not allow Render's address |
+| Google says `redirect_uri_mismatch` | The redirect URIs in step 2 do not match your address exactly (scheme, host, no trailing slash) |
+| "Posting to YouTube is not set up" | `GOOGLE_LOGIN_CLIENT_ID` and `GOOGLE_LOGIN_CLIENT_SECRET` are missing |
+| "This server is not set up to store keys" | `APP_SECRET_KEY` is missing |
+| "This server is not set up to store clips" | The `BLOMP_*` values are missing |
 | Jobs fail while downloading | YouTube is blocking the server's address |
-| Everything resets after a restart | The service is on a plan without a disk, or `CLIPPER_DATA_DIR` is not `/data` |
 | Build fails | Open the build log in Render; `docker build -t clipper .` reproduces it locally |

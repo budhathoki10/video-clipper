@@ -1,179 +1,181 @@
-"""SQLite storage. One short-lived connection per call; WAL so the API and
-the worker process can read and write at the same time."""
+"""MongoDB storage.
+
+Everything the app remembers lives in one MongoDB database, reached through MONGODB_URI: jobs,
+clips, posts, accounts, sessions, each person's settings, keys and YouTube connection. Nothing is
+kept on the server's own disk, so the server can be replaced at any time. Finished clips and
+downloaded videos are in the S3-compatible storage (see storage.py); here is only their address.
+
+Every document has a string `id` (also its `_id`). The API and the worker are separate processes
+that share this database.
+"""
 from __future__ import annotations
 
-import json
-import sqlite3
+import os
+import threading
 import time
 import uuid
 from typing import Any
 
 from . import config
 
-JSON_COLS = {"options", "payload", "hashtags", "panel", "value"}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-  id TEXT PRIMARY KEY, kind TEXT NOT NULL, url TEXT, status TEXT NOT NULL,
-  step TEXT, progress REAL DEFAULT 0, title TEXT, channel TEXT, duration REAL,
-  thumbnail TEXT, error TEXT, options TEXT, payload TEXT,
-  created_at REAL, updated_at REAL, user_id TEXT
-);
-CREATE TABLE IF NOT EXISTS clips (
-  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
-  start REAL, end REAL, title TEXT, hook TEXT, description TEXT, hashtags TEXT,
-  reason TEXT, ai_score REAL, panel_score REAL, panel TEXT,
-  file TEXT, thumb TEXT, width INTEGER, height INTEGER,
-  source_title TEXT, source_channel TEXT, source_url TEXT,
-  options TEXT, error TEXT, created_at REAL
-);
-CREATE TABLE IF NOT EXISTS posts (
-  id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, status TEXT NOT NULL,
-  title TEXT, description TEXT, privacy TEXT, publish_at TEXT,
-  youtube_id TEXT, views INTEGER, error TEXT, created_at REAL, updated_at REAL, kind TEXT, user_id TEXT
-);
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-  password_hash TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0,
-  google_sub TEXT, avatar_url TEXT,
-  created_at REAL NOT NULL, last_login_at REAL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL,
-  created_at REAL NOT NULL, last_seen_at REAL NOT NULL, expires_at REAL NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS oauth_states (
-  state_hash TEXT PRIMARY KEY, code_verifier TEXT NOT NULL, redirect_uri TEXT NOT NULL,
-  created_at REAL NOT NULL, expires_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
-CREATE INDEX IF NOT EXISTS idx_clips_job ON clips(job_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_seen_at, expires_at);
-"""
+class DatabaseError(RuntimeError):
+    """Raised with a message that is safe to show to the user."""
 
 
-def connect() -> sqlite3.Connection:
-    config.ensure_dirs()
-    conn = sqlite3.connect(config.DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+_client: Any = None
+_lock = threading.Lock()
+
+
+def _make_client() -> Any:
+    if os.environ.get("CLIPPER_MONGO_MOCK") == "1":  # tests: an in-memory stand-in, no server
+        import mongomock
+
+        return mongomock.MongoClient()
+    uri = config.mongodb_uri()
+    if not uri:
+        raise DatabaseError("The database is not set up. Add MONGODB_URI to backend/.env "
+                            "(or to the server's environment) and restart.")
+    from pymongo import MongoClient
+
+    return MongoClient(uri, serverSelectionTimeoutMS=10000, appname="clipper")
+
+
+def database() -> Any:
+    global _client
+    with _lock:
+        if _client is None:
+            _client = _make_client()
+    return _client[config.mongodb_name()]
+
+
+def reset_connection() -> None:
+    """Forget the connection (tests, and a changed MONGODB_URI)."""
+    global _client
+    with _lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception:
+                pass
+        _client = None
+
+
+def coll(name: str) -> Any:
+    return database()[name]
 
 
 def init() -> None:
-    with connect() as conn:
-        conn.executescript(SCHEMA)
-        # Databases made before posts had a kind (short or video) get the column.
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)")}
-        if "kind" not in columns:
-            conn.execute("ALTER TABLE posts ADD COLUMN kind TEXT")
-        # Databases made before accounts owned their work get an owner column (empty = the owner's).
-        for table in ("jobs", "posts"):
-            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            if "user_id" not in have:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
-        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-        if "google_sub" not in user_columns:
-            conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
-        if "avatar_url" not in user_columns:
-            conn.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
+    """Create the indexes the app relies on. Safe to run on every start."""
+    d = database()
+    d.jobs.create_index([("user_id", 1), ("created_at", -1)])
+    d.jobs.create_index([("status", 1), ("created_at", 1)])
+    d.clips.create_index([("job_id", 1)])
+    d.clips.create_index([("user_id", 1), ("created_at", -1)])
+    d.posts.create_index([("user_id", 1), ("created_at", -1)])
+    d.users.create_index([("email", 1)], unique=True)
+    d.users.create_index([("google_sub", 1)], unique=True, sparse=True)
+    d.sessions.create_index([("token_hash", 1)], unique=True)
+    d.sessions.create_index([("user_id", 1)])
+    d.oauth_states.create_index([("state_hash", 1)], unique=True)
 
 
 def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _decode(row: sqlite3.Row) -> dict[str, Any]:
-    out = dict(row)
-    for key in JSON_COLS & out.keys():
-        if out[key] is not None:
-            try:
-                out[key] = json.loads(out[key])
-            except (TypeError, ValueError):
-                pass
-    return out
+def _clean(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    if doc is not None:
+        doc.pop("_id", None)
+    return doc
 
 
-def _encode(values: dict[str, Any]) -> dict[str, Any]:
-    return {
-        k: json.dumps(v) if k in JSON_COLS and v is not None and not isinstance(v, str) else v
-        for k, v in values.items()
-    }
+def find(name: str, filt: dict[str, Any] | None = None, *, sort: list[tuple[str, int]] | None = None,
+         limit: int = 0, fields: list[str] | None = None) -> list[dict[str, Any]]:
+    cursor = coll(name).find(filt or {}, {f: 1 for f in fields} if fields else None)
+    if sort:
+        cursor = cursor.sort(sort)
+    if limit:
+        cursor = cursor.limit(limit)
+    return [_clean(doc) for doc in cursor]
 
 
-def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-    conn = connect()
-    try:
-        return [_decode(r) for r in conn.execute(sql, params).fetchall()]
-    finally:
-        conn.close()
+def find_one(name: str, filt: dict[str, Any]) -> dict[str, Any] | None:
+    return _clean(coll(name).find_one(filt))
 
 
-def one(sql: str, params: tuple = ()) -> dict[str, Any] | None:
-    rows = query(sql, params)
-    return rows[0] if rows else None
+def count(name: str, filt: dict[str, Any] | None = None) -> int:
+    return coll(name).count_documents(filt or {})
 
 
-def execute(sql: str, params: tuple = ()) -> int:
-    conn = connect()
-    try:
-        with conn:
-            return conn.execute(sql, params).rowcount
-    finally:
-        conn.close()
+# Fields code reads without checking they exist. A new document starts with them empty, the way a
+# table row would, so `clip["error"]` is None rather than missing.
+COLUMNS = {
+    "jobs": ("url", "step", "progress", "title", "channel", "duration", "thumbnail", "error", "options",
+             "payload", "files", "user_id"),
+    "clips": ("user_id", "start", "end", "title", "hook", "description", "hashtags", "reason", "ai_score",
+              "panel_score", "panel", "file", "thumb", "width", "height", "source_title", "source_channel",
+              "source_url", "options", "error"),
+    "posts": ("user_id", "title", "description", "privacy", "publish_at", "youtube_id", "views", "error",
+              "kind"),
+}
 
 
-def insert(table: str, values: dict[str, Any]) -> None:
-    values = _encode(values)
-    cols = ", ".join(values)
-    marks = ", ".join("?" for _ in values)
-    execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", tuple(values.values()))
+def insert(name: str, doc: dict[str, Any]) -> dict[str, Any]:
+    doc = dict(doc)
+    doc.setdefault("id", new_id())
+    for column in COLUMNS.get(name, ()):
+        doc.setdefault(column, None)
+    coll(name).insert_one({**doc, "_id": doc["id"]})
+    return doc
 
 
-def update(table: str, row_id: str, **values: Any) -> None:
-    if table in ("jobs", "posts"):
+def update(collection: str, row_id: str, /, **values: Any) -> None:
+    if collection in ("jobs", "posts"):
         values.setdefault("updated_at", time.time())
-    values = _encode(values)
-    sets = ", ".join(f"{k} = ?" for k in values)
-    execute(f"UPDATE {table} SET {sets} WHERE id = ?", (*values.values(), row_id))
+    coll(collection).update_one({"_id": row_id}, {"$set": values})
 
 
+def update_where(name: str, filt: dict[str, Any], values: dict[str, Any]) -> int:
+    return coll(name).update_many(filt, {"$set": values}).modified_count
+
+
+def delete(name: str, filt: dict[str, Any]) -> int:
+    return coll(name).delete_many(filt).deleted_count
+
+
+def claim_job(job_id: str) -> bool:
+    """Take a queued job for this worker. Only one caller can win."""
+    now = time.time()
+    return coll("jobs").find_one_and_update(
+        {"_id": job_id, "status": "queued"}, {"$set": {"status": "running", "updated_at": now}}) is not None
+
+
+# ---- small key/value store (settings, worker heartbeat, trends) ---------------------------------
 def kv_get(key: str, default: Any = None) -> Any:
-    row = one("SELECT value FROM kv WHERE key = ?", (key,))
-    return row["value"] if row else default
+    doc = coll("kv").find_one({"_id": key})
+    return doc["value"] if doc else default
 
 
 def kv_set(key: str, value: Any) -> None:
-    execute(
-        "INSERT INTO kv (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, json.dumps(value)),
-    )
+    coll("kv").replace_one({"_id": key}, {"_id": key, "value": value}, upsert=True)
+
+
+def kv_delete(key: str) -> None:
+    coll("kv").delete_one({"_id": key})
+
+
+# ---- settings -----------------------------------------------------------------------------------
+# App-wide defaults come from config.DEFAULT_SETTINGS. Each person's own choices are saved under
+# their id and layered on top. Storage is server configuration and is never per person.
+USER_SETTINGS = ("clip", "format", "captions", "overlay", "live", "ai", "posting")
 
 
 def get_settings() -> dict[str, Any]:
     return config.deep_merge(config.DEFAULT_SETTINGS, kv_get("settings", {}))
 
 
-def save_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    merged = config.deep_merge(kv_get("settings", {}), patch)
-    kv_set("settings", merged)
-    return get_settings()
-
-
-# Settings a signed-in person can change for themselves. The rest (AI engine, trends, storage,
-# posting) belong to the owner of the app and apply to everyone.
-USER_SETTINGS = ("clip", "format", "captions", "overlay", "live")
-
-
 def settings_for(user_id: str | None) -> dict[str, Any]:
-    """The owner's settings with one person's own choices on top."""
     base = get_settings()
     if not user_id:
         return base

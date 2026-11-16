@@ -133,7 +133,7 @@ export interface Settings {
   posting: { privacy: "private" | "unlisted" | "public"; hashtags: string; credit: boolean };
 }
 
-export type SecretStatus = Record<string, { set: boolean; hint: string }>;
+export type SecretStatus = Record<string, { set: boolean; hint: string; shared?: boolean }>;
 
 export interface YouTubeStatus {
   client_configured: boolean;
@@ -157,24 +157,12 @@ export interface AuthUser {
   email: string;
   name: string;
   avatar_url: string | null;
-  is_admin: boolean;
   created_at: number;
   last_login_at: number | null;
 }
 
-export interface UserStats {
-  total_users: number;
-  active_users: number;
-}
-
 export interface AuthSession {
   user: AuthUser;
-  stats: UserStats | null;
-}
-
-export interface ManagedUser extends AuthUser {
-  last_seen_at: number | null;
-  active: number;
 }
 
 export interface TrendVideo {
