@@ -1,0 +1,328 @@
+@import "tailwindcss";
+
+/*
+  Design tokens: a light, premium video-production look.
+  Surfaces: page #F5F7FB, cards/sidebar/dialogs white, secondary surfaces #EEF2F7.
+  One accent (electric blue) and three semantic colours. Depth comes from hairline
+  borders and very soft shadows. Text is navy, never pure black.
+  Colours that carry small text (success, warning, error) have a darker "-ink"
+  shade so they stay readable on white; the base colour is for fills and icons.
+*/
+@theme {
+  --color-bg: #f5f7fb;
+  --color-surface: #ffffff;
+  --color-raised: #eef2f7;
+  --color-hover: #e6ebf2;
+  --color-line-subtle: #eef1f6;
+  --color-line: #e5eaf1;
+  --color-line-strong: #d2dae6;
+  --color-ink: #202b3c;
+  --color-ink-2: #4a586c;
+  --color-ink-3: #66758c;
+  --color-accent: #3478f6;
+  --color-accent-hover: #2362d9;
+  --color-accent-ink: #ffffff;
+  --color-accent-soft: #3478f61a;
+  --color-ok: #16a36a;
+  --color-ok-ink: #0e7a50;
+  --color-ok-soft: #16a36a1a;
+  --color-warn: #d99118;
+  --color-warn-ink: #94600b;
+  --color-warn-soft: #d991181f;
+  --color-bad: #dc4545;
+  --color-bad-ink: #b42f2f;
+  --color-bad-soft: #dc45451a;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "Cascadia Mono", monospace;
+
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+  --text-xl: 24px;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+
+  --shadow-soft: 0 1px 2px rgb(32 43 60 / 0.04), 0 2px 8px rgb(32 43 60 / 0.04);
+  --shadow-lift: 0 2px 4px rgb(32 43 60 / 0.05), 0 8px 20px rgb(32 43 60 / 0.07);
+  --shadow-pop: 0 4px 8px rgb(32 43 60 / 0.06), 0 16px 40px rgb(32 43 60 / 0.14);
+
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@layer base {
+  html {
+    background: var(--color-bg);
+    color-scheme: light;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    overscroll-behavior-y: none;
+    color: var(--color-ink);
+    background: var(--color-bg);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    line-height: 1.25;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  a,
+  button,
+  select,
+  input,
+  textarea,
+  [role="button"],
+  [role="radio"],
+  [role="tab"] {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation; /* no double-tap zoom delay on iPhone */
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: #3478f633;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 120ms var(--ease-out), border-color 120ms var(--ease-out),
+      color 120ms var(--ease-out), box-shadow 120ms var(--ease-out);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn svg {
+    width: 15px;
+    height: 15px;
+    flex: none;
+  }
+  .btn-lg {
+    height: 44px;
+    padding: 0 18px;
+    font-size: var(--text-base);
+  }
+  .btn-icon {
+    width: 36px;
+    padding: 0;
+  }
+  .btn-primary {
+    background: var(--color-accent);
+    color: var(--color-accent-ink);
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgb(35 98 217 / 0.3);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-accent-hover);
+  }
+  .btn-primary:active:not(:disabled) {
+    background: var(--color-accent-hover);
+    box-shadow: none;
+  }
+  .btn-secondary {
+    background: var(--color-surface);
+    border-color: var(--color-line-strong);
+    color: var(--color-ink);
+    box-shadow: 0 1px 2px rgb(32 43 60 / 0.04);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--color-raised);
+  }
+  .btn-secondary:active:not(:disabled) {
+    background: var(--color-hover);
+    box-shadow: none;
+  }
+  .btn-ghost {
+    color: var(--color-ink-2);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-raised);
+    color: var(--color-ink);
+  }
+  .btn-danger {
+    background: var(--color-surface);
+    border-color: var(--color-line-strong);
+    color: var(--color-bad-ink);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: var(--color-bad-soft);
+    border-color: var(--color-bad);
+  }
+
+  .field {
+    width: 100%;
+    height: 36px;
+    padding: 0 12px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius-md);
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    transition: border-color 120ms var(--ease-out), box-shadow 120ms var(--ease-out);
+  }
+  .field::placeholder {
+    color: var(--color-ink-3);
+    opacity: 0.8;
+  }
+  .field:hover:not(:disabled) {
+    border-color: #b9c4d4;
+  }
+  .field:focus-visible {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px var(--color-accent-soft);
+  }
+  .field:disabled {
+    background: var(--color-raised);
+    opacity: 0.7;
+    cursor: not-allowed;
+  }
+  .field[aria-invalid="true"] {
+    border-color: var(--color-bad);
+  }
+  textarea.field {
+    height: auto;
+    padding: 9px 12px;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  select.field {
+    appearance: none;
+    padding-right: 30px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2366758c' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 11px center;
+  }
+  input[type="color"].field {
+    padding: 4px;
+    cursor: pointer;
+  }
+  .field-lg {
+    height: 44px;
+    padding: 0 14px;
+    font-size: var(--text-base);
+  }
+
+  .panel {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-soft);
+  }
+  .panel table thead {
+    background: var(--color-bg);
+  }
+  .panel table thead th {
+    font-weight: 500;
+    letter-spacing: 0.01em;
+  }
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border: 1px solid var(--color-line-strong);
+    border-radius: 4px;
+    background: var(--color-raised);
+    color: var(--color-ink-3);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1;
+  }
+  .skeleton {
+    background: var(--color-raised);
+    border-radius: var(--radius-sm);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-enter {
+  animation: enter 160ms var(--ease-out);
+}
+.animate-spin-slow {
+  animation: spin 800ms linear infinite;
+}
+
+/* Touch screens: 44 px targets, and 16 px text in fields (iPhone zooms into smaller text). */
+@media (pointer: coarse) {
+  .btn {
+    height: 44px;
+  }
+  .btn-lg {
+    height: 48px;
+  }
+  .btn-icon {
+    width: 44px;
+  }
+  .field,
+  select.field {
+    height: 44px;
+  }
+  .field,
+  select.field,
+  textarea.field {
+    font-size: 16px;
+  }
+  textarea.field {
+    height: auto; /* text areas size to their rows, not the 44 px field height */
+  }
+}
