@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, url TEXT, status TEXT NOT NULL,
   step TEXT, progress REAL DEFAULT 0, title TEXT, channel TEXT, duration REAL,
   thumbnail TEXT, error TEXT, options TEXT, payload TEXT,
-  created_at REAL, updated_at REAL
+  created_at REAL, updated_at REAL, user_id TEXT
 );
 CREATE TABLE IF NOT EXISTS clips (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS clips (
 CREATE TABLE IF NOT EXISTS posts (
   id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, status TEXT NOT NULL,
   title TEXT, description TEXT, privacy TEXT, publish_at TEXT,
-  youtube_id TEXT, views INTEGER, error TEXT, created_at REAL, updated_at REAL, kind TEXT
+  youtube_id TEXT, views INTEGER, error TEXT, created_at REAL, updated_at REAL, kind TEXT, user_id TEXT
 );
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
@@ -71,6 +71,12 @@ def init() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)")}
         if "kind" not in columns:
             conn.execute("ALTER TABLE posts ADD COLUMN kind TEXT")
+        # Databases made before accounts owned their work get an owner column (empty = the owner's).
+        for table in ("jobs", "posts"):
+            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "user_id" not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
         user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         if "google_sub" not in user_columns:
             conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
@@ -159,3 +165,20 @@ def save_settings(patch: dict[str, Any]) -> dict[str, Any]:
     merged = config.deep_merge(kv_get("settings", {}), patch)
     kv_set("settings", merged)
     return get_settings()
+
+
+# Settings a signed-in person can change for themselves. The rest (AI engine, trends, storage,
+# posting) belong to the owner of the app and apply to everyone.
+USER_SETTINGS = ("clip", "format", "captions", "overlay", "live")
+
+
+def settings_for(user_id: str | None) -> dict[str, Any]:
+    """The owner's settings with one person's own choices on top."""
+    base = get_settings()
+    if not user_id:
+        return base
+    return config.deep_merge(base, kv_get(f"prefs:{user_id}", {}) or {})
+
+
+def save_prefs(user_id: str, patch: dict[str, Any]) -> None:
+    kv_set(f"prefs:{user_id}", config.deep_merge(kv_get(f"prefs:{user_id}", {}) or {}, patch))

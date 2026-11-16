@@ -83,7 +83,9 @@ cd ..
 scripts\start.ps1
 ```
 
-Open the dashboard and sign in with Google. The first account becomes the administrator.
+Open the dashboard and sign in with Google. The first account becomes the owner (set `ADMIN_EMAILS`
+in `backend/.env` to name the owner instead). Everyone else who signs in has their own private
+workspace.
 
 ## Layout
 

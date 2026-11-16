@@ -812,21 +812,9 @@ def test_only_allowed_emails_can_sign_in(monkeypatch):
     db.execute("DELETE FROM users")
 
 
-def test_a_hosted_app_without_an_allow_list_keeps_sign_up_closed(monkeypatch):
-    from app import auth
-
-    db.execute("DELETE FROM sessions")
-    db.execute("DELETE FROM users")
-    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
+def test_public_address_is_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com/")
     assert config.public_url() == "https://clipper.example.com"
-    with pytest.raises(auth.AuthError, match="closed"):
-        auth.upsert_google_user({"sub": "s9", "email": "a@example.com", "email_verified": True})
-    assert db.one("SELECT COUNT(*) AS n FROM users")["n"] == 0
-    monkeypatch.delenv("PUBLIC_URL")
-    assert auth.upsert_google_user({"sub": "s9", "email": "a@example.com", "email_verified": True})["is_admin"]
-    db.execute("DELETE FROM users")
-
 
 def test_hosted_youtube_connect_uses_a_web_redirect_and_checks_state(monkeypatch, tmp_path):
     from google_auth_oauthlib.flow import Flow
@@ -912,3 +900,108 @@ def test_render_supplies_the_public_address_itself(monkeypatch):
     assert config.public_url() == "https://clipper-abc.onrender.com"
     monkeypatch.setenv("PUBLIC_URL", "https://clips.example.com/")
     assert config.public_url() == "https://clips.example.com", "an explicit PUBLIC_URL (custom domain) wins"
+
+
+def _person(email, sub):
+    from app import auth
+
+    return auth.upsert_google_user({"sub": sub, "email": email, "email_verified": True, "name": email})
+
+
+def test_anyone_can_sign_in_and_only_the_named_owner_is_administrator(monkeypatch):
+    from app import auth
+
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
+    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    monkeypatch.setenv("ADMIN_EMAILS", "Owner@Example.com")
+    stranger = _person("stranger@example.com", "s1")  # arrives first
+    owner = _person("owner@example.com", "s2")
+    assert stranger["is_admin"] is False, "a stranger who arrives first must not become the owner"
+    assert owner["is_admin"] is True
+
+    monkeypatch.setenv("ALLOWED_EMAILS", "owner@example.com")  # an optional list still works
+    with pytest.raises(auth.AuthError, match="not allowed"):
+        _person("someone@example.com", "s3")
+
+    monkeypatch.delenv("ALLOWED_EMAILS")
+    monkeypatch.delenv("ADMIN_EMAILS")
+    db.execute("DELETE FROM users")
+    assert _person("first@example.com", "s4")["is_admin"] is True, "with no owner named the first account is"
+    assert _person("second@example.com", "s5")["is_admin"] is False
+    db.execute("DELETE FROM users")
+
+
+def test_people_see_only_their_own_work_and_cannot_touch_the_owners_things(monkeypatch):
+    from app import auth
+
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    monkeypatch.setenv("ADMIN_EMAILS", "owner@example.com")
+    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")
+    owner, ann, bob = (_person("owner@example.com", "o"), _person("ann@example.com", "a"),
+                       _person("bob@example.com", "b"))
+    for who, person in (("ann", ann), ("bob", bob)):
+        db.execute("DELETE FROM jobs WHERE id = ?", (f"{who}-job",))
+        db.execute("DELETE FROM clips WHERE id = ?", (f"{who}-clip",))
+        db.insert("jobs", {"id": f"{who}-job", "kind": "video", "status": "done", "title": who,
+                           "options": {}, "payload": {}, "created_at": time.time(), "updated_at": time.time(),
+                           "user_id": person["id"]})
+        db.insert("clips", {"id": f"{who}-clip", "job_id": f"{who}-job", "status": "ready", "start": 0, "end": 20,
+                            "title": who, "options": {}, "created_at": time.time()})
+
+    def browser(person):
+        client_for = TestClient(app)
+        client_for.cookies.set(auth.SESSION_COOKIE, auth.create_session(person["id"]))
+        return client_for
+
+    owner_c, ann_c, bob_c = browser(owner), browser(ann), browser(bob)
+
+    # Work belongs to the person who made it.
+    assert {j["id"] for j in ann_c.get("/api/jobs").json()} == {"ann-job"}
+    assert {j["id"] for j in owner_c.get("/api/jobs").json()} >= {"ann-job", "bob-job"}, "the owner sees all"
+    assert [c["id"] for c in ann_c.get("/api/clips").json()] == ["ann-clip"]
+    for call in (ann_c.get("/api/jobs/bob-job"), ann_c.delete("/api/jobs/bob-job"),
+                 ann_c.post("/api/jobs/bob-job/stop"), ann_c.get("/api/clips/bob-clip"),
+                 ann_c.patch("/api/clips/bob-clip", json={"title": "mine now"}),
+                 ann_c.delete("/api/clips/bob-clip"), ann_c.get("/api/clips/bob-clip/download")):
+        assert call.status_code == 404, "someone else's work looks like it does not exist"
+    assert db.one("SELECT title FROM clips WHERE id = 'bob-clip'")["title"] == "bob"
+
+    # The owner's keys, engine, storage and YouTube channel stay the owner's.
+    assert ann_c.put("/api/secrets", json={"name": "NVIDIA_API_KEY", "value": "x" * 20}).status_code == 403
+    assert ann_c.post("/api/posts", json={"clip_id": "ann-clip"}).status_code == 403
+    assert ann_c.post("/api/storage/test").status_code == 403
+    assert ann_c.post("/api/ai/test").status_code == 403
+    assert ann_c.get("/api/posts").json() == []
+    assert all(item["hint"] == "" for item in ann_c.get("/api/settings").json()["secrets"].values())
+
+    # Clip, format and caption choices are per person; the AI engine is not theirs to change.
+    provider = owner_c.get("/api/settings").json()["settings"]["ai"]["provider"]
+    shared_max = owner_c.get("/api/settings").json()["settings"]["clip"]["max_sec"]
+    assert ann_c.put("/api/settings", json={"clip": {"max_sec": 45}, "ai": {"provider": "gemini"}}).status_code == 200
+    assert ann_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == 45
+    assert bob_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == shared_max
+    assert owner_c.get("/api/settings").json()["settings"]["clip"]["max_sec"] == shared_max
+    assert owner_c.get("/api/settings").json()["settings"]["ai"]["provider"] == provider
+
+    # A guest may have two videos in progress; the owner has no limit.
+    made = []
+    for n in range(2):
+        response = ann_c.post("/api/jobs", json={"url": f"https://example.com/watch?v={n}"})
+        assert response.status_code == 201, response.text
+        made.append(response.json()["id"])
+    assert ann_c.post("/api/jobs", json={"url": "https://example.com/watch?v=9"}).status_code == 429
+    again = owner_c.post("/api/jobs", json={"url": "https://example.com/watch?v=10"})
+    assert again.status_code == 201
+    made.append(again.json()["id"])
+    assert db.one("SELECT user_id FROM jobs WHERE id = ?", (made[0],))["user_id"] == ann["id"]
+
+    for job_id in made + ["ann-job", "bob-job"]:
+        db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    db.execute("DELETE FROM clips WHERE id IN ('ann-clip', 'bob-clip')")
+    db.execute("DELETE FROM kv WHERE key LIKE 'prefs:%'")
+    db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM users")

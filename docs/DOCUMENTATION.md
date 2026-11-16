@@ -60,7 +60,11 @@ Browser  ──►  FastAPI (app.main)  ──►  SQLite (data/clipper.db)  ◄
 - **No Redis, no external queue.** SQLite in WAL mode lets both processes read and write concurrently.
 - **Google accounts protect the API.** Google OpenID Connect supplies a verified identity; the stable
   `sub` claim identifies the account. The browser receives an opaque 30-day HttpOnly session cookie;
-  only its SHA-256 digest is stored. The first account is the administrator and can view activity.
+  only its SHA-256 digest is stored. Anyone with a Google account can sign in. Jobs and posts carry a
+  `user_id`; each person sees only their own work and has their own clip/format/caption settings. The
+  owner (`ADMIN_EMAILS`, or the first account if none is set) sees everything and alone changes keys,
+  the AI engine, storage and the YouTube channel, and posts to it. A person may have two videos in
+  progress at a time. `ALLOWED_EMAILS` can still restrict who may sign in.
 
 ### Technology
 Python 3.11+ (developed on 3.13), FastAPI, SQLite, yt-dlp, ffmpeg (NVENC when available, x264

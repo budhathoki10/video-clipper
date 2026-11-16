@@ -44,6 +44,12 @@ Restart with `stop.ps1` then `start.ps1` after backend changes (the worker is a 
 9. **Git.** Do not commit, push or open PRs unless the owner asks. Never add `Co-Authored-By`, "Generated
    with" lines or session links to commits or PRs.
 
+10. **People are separate.** Every job and post has a `user_id`; read and change work only through
+   `_job_for`, `_clip_for` and `_visible` in `main.py` so one person never reaches another's work (a
+   stranger's id returns 404). Keys, the AI engine, storage, the YouTube channel and posting are
+   owner-only (`_require_admin`). New routes that touch jobs, clips, posts or settings must follow
+   this and get a test.
+
 ## Things easy to get wrong
 - Jobs resume from files in `data/jobs/<id>/`; a step must write its result before the next step reads it.
 - A clip's `file`/`thumb` are `s3:<key>` (remote) or a path relative to `data/` (local): use

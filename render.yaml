@@ -24,9 +24,10 @@ services:
       # Where jobs, the database and the YouTube token live (the disk above).
       - key: CLIPPER_DATA_DIR
         value: /data
-      # Who may sign in: comma-separated Google emails. With this empty nobody can create an
-      # account, so set it to your own address before the first sign-in.
-      - key: ALLOWED_EMAILS
+      # The owner: your Google email (comma-separated for more than one). Anyone can sign in and
+      # make clips, but only owners change keys and settings for everyone or post to your channel.
+      # Without this, the first account to sign in becomes the owner.
+      - key: ADMIN_EMAILS
         sync: false
       # Google "Web application" OAuth client: used for the app sign-in and for connecting YouTube.
       - key: GOOGLE_LOGIN_CLIENT_ID
