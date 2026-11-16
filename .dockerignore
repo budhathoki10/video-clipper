@@ -1,0 +1,16 @@
+# Never bake secrets, local data or build output into the image.
+.git
+**/.env
+**/.env.*
+!**/.env.example
+data
+backend/.venv
+backend/tests
+backend/.pytest_cache
+**/__pycache__
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/ios
+docs
+scripts
