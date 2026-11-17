@@ -80,11 +80,14 @@ def _friendly(exc: Exception) -> str:
 
 
 def network_options() -> dict[str, Any]:
-    """Optional settings for servers YouTube treats as bots. YTDLP_PROXY is a proxy address (a
+    """Settings for servers YouTube treats as bots. YTDLP_PROXY is a proxy address (a
     residential proxy works best). YTDLP_COOKIES_FILE, or a Render secret file named cookies.txt, is
     a Netscape-format cookies file; a copy is used because the original may be read-only. Nothing
-    changes when neither is set."""
-    opts: dict[str, Any] = {}
+    changes when neither is set (the JavaScript runtimes below are always allowed)."""
+    # YouTube hides its video formats behind a small JavaScript puzzle. yt-dlp solves it with Deno by
+    # default; the server image has Node, so allow both. Without this the only formats found are
+    # thumbnails and the download fails with "Requested format is not available".
+    opts: dict[str, Any] = {"js_runtimes": {"deno": {}, "node": {}}}
     proxy = config.secret("YTDLP_PROXY")
     if proxy:
         opts["proxy"] = proxy

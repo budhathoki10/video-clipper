@@ -1088,7 +1088,9 @@ def test_download_options_for_a_server_youtube_blocks(monkeypatch, tmp_path):
 
     monkeypatch.delenv("YTDLP_PROXY", raising=False)
     monkeypatch.setenv("YTDLP_COOKIES_FILE", str(tmp_path / "missing.txt"))
-    assert media.network_options() == {}, "nothing changes unless a proxy or cookies are set"
+    plain = media.network_options()
+    assert "proxy" not in plain and "cookiefile" not in plain, "no proxy or cookies unless they are set"
+    assert "node" in plain["js_runtimes"], "the server has Node, so yt-dlp may solve YouTube's JavaScript with it"
 
     cookies = tmp_path / "cookies.txt"
     cookies.write_text("# Netscape HTTP Cookie File" + chr(10), encoding="utf-8")
