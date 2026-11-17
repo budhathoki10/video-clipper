@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 import yt_dlp
 from yt_dlp.utils import DownloadError, download_range_func
+
+from .. import config
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -59,6 +64,9 @@ def _friendly(exc: Exception) -> str:
         return "This video is private."
     if "sign in to confirm" in lowered or "age" in lowered and "confirm" in lowered:
         return "YouTube wants a sign-in for this video (age or bot check), so it cannot be downloaded."
+    if "player response" in lowered or "http error 403" in lowered or "bot" in lowered and "not a" in lowered:
+        return ("YouTube is blocking this server from reading videos right now. The link is fine. "
+                "Try again later, or ask whoever runs Clipper to set up a download proxy.")
     if "unavailable" in lowered:
         return "This video is unavailable."
     if "unsupported url" in lowered or "is not a valid url" in lowered:
@@ -68,9 +76,26 @@ def _friendly(exc: Exception) -> str:
     return text.splitlines()[0][:300] if text else "Download failed."
 
 
+def network_options() -> dict[str, Any]:
+    """Optional settings for servers YouTube treats as bots. YTDLP_PROXY is a proxy address (a
+    residential proxy works best). YTDLP_COOKIES_FILE, or a Render secret file named cookies.txt, is
+    a Netscape-format cookies file; a copy is used because the original may be read-only. Nothing
+    changes when neither is set."""
+    opts: dict[str, Any] = {}
+    proxy = config.secret("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+    cookies = Path(config.secret("YTDLP_COOKIES_FILE") or "/etc/secrets/cookies.txt")
+    if cookies.is_file():
+        copy = Path(tempfile.gettempdir()) / f"clipper-cookies-{os.getpid()}.txt"
+        shutil.copyfile(cookies, copy)
+        opts["cookiefile"] = str(copy)
+    return opts
+
+
 def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b"}
+            "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b", **network_options()}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -115,6 +140,7 @@ def download(url: str, dest_dir: Path, *, max_height: int = 1080,
         "outtmpl": str(dest_dir / "source.%(ext)s"),
         "progress_hooks": [hook],
         "retries": 5, "fragment_retries": 5, "concurrent_fragment_downloads": 4,
+        **network_options(),
     }
     if max_minutes:
         opts["download_ranges"] = download_range_func(None, [(0, max_minutes * 60)])
