@@ -79,6 +79,9 @@ def _friendly(exc: Exception) -> str:
     return text.splitlines()[0][:300] if text else "Download failed."
 
 
+COOKIE_CLIENTS = ["tv", "tv_downgraded", "web_embedded", "web_safari"]
+
+
 def network_options() -> dict[str, Any]:
     """Settings for servers YouTube treats as bots. YTDLP_PROXY is a proxy address (a
     residential proxy works best). YTDLP_COOKIES_FILE, or a Render secret file named cookies.txt, is
@@ -96,6 +99,13 @@ def network_options() -> dict[str, Any]:
         copy = Path(tempfile.gettempdir()) / f"clipper-cookies-{os.getpid()}.txt"
         shutil.copyfile(cookies, copy)
         opts["cookiefile"] = str(copy)
+        # With cookies yt-dlp may only use browser-type clients, and YouTube gives those no video files
+        # without a special token (only thumbnails). The TV and embedded clients accept cookies and
+        # need no token, so prefer them. YTDLP_CLIENTS (comma separated) overrides this.
+        opts["extractor_args"] = {"youtube": {"player_client": COOKIE_CLIENTS}}
+    clients = [c.strip() for c in config.secret("YTDLP_CLIENTS").split(",") if c.strip()]
+    if clients:
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
     return opts
 
 
