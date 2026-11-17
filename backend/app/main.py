@@ -183,7 +183,9 @@ def _check_quota(request: Request) -> None:
 def queue_job(kind: str, *, user_id: str, url: str | None = None, options: dict | None = None,
               payload: dict | None = None, title: str | None = None,
               job_id: str | None = None) -> dict[str, Any]:
-    job = {"id": job_id or db.new_id(), "kind": kind, "url": url, "status": "queued", "step": "Queued",
+    # A link job on a server whose worker does not take links waits for a home computer's worker.
+    step = worker.WAITING_FOR_HOME if url and kind in ("auto", "video", "live") and worker.ACCEPTS == "files" else "Queued"
+    job = {"id": job_id or db.new_id(), "kind": kind, "url": url, "status": "queued", "step": step,
            "progress": 0, "title": title, "options": options or {}, "payload": payload or {},
            "created_at": time.time(), "updated_at": time.time(), "user_id": user_id}
     db.insert("jobs", job)
@@ -545,7 +547,8 @@ def retry_job(job_id: str, request: Request) -> dict[str, str]:
     if job["status"] not in ("failed", "cancelled"):
         raise fail(409, "Only failed or cancelled jobs can be retried.")
     _check_quota(request)
-    db.update("jobs", job_id, status="queued", step="Queued", error=None)
+    waits = worker.ACCEPTS == "files" and job.get("url") and job["kind"] in ("auto", "video", "live")
+    db.update("jobs", job_id, status="queued", step=worker.WAITING_FOR_HOME if waits else "Queued", error=None)
     ensure_worker()
     return {"status": "queued"}
 

@@ -75,6 +75,11 @@ Browser  ──►  FastAPI (app.main)  ──►  MongoDB  ◄──  Worker (a
   `runner.persist_job_files` uploads them and clears the folder, and `restore_job_files` brings them back
   for "more clips", re-rendering and hooks.
 
+- **Several computers, one app.** Any number of workers can share the database; each is named after its
+  computer (`worker:<host>` heartbeat) and takes only the jobs it accepts (`CLIPPER_WORKER_ACCEPTS`: `all`,
+  `links` or `files`). A job is claimed atomically and records which computer runs it (`worker`). Jobs of a
+  computer whose heartbeat stopped for 90 s are returned to the queue (`requeue_orphans`). This lets a home PC
+  take YouTube-link jobs that a hosting server cannot download; see docs/DEPLOY_RENDER.md.
 - **Upload a video file.** Instead of a link, a person can upload a file (`POST /api/uploads`, then
   `PUT /api/uploads/<id>/chunk?offset=N` for parts of up to 16 MB, then `POST /api/uploads/<id>/complete`).
   The parts are written to a scratch folder under `CLIPPER_DATA_DIR/uploads`, checked with ffprobe, then moved
