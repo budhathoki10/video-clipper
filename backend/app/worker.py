@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -20,8 +21,17 @@ from typing import Any
 from . import config, db, live, llm, runner, storage, youtube
 from .pipeline import media, trends
 
-HEARTBEAT_KEY = "worker"
+# Several workers, on different computers, can share one database. Each is known by its computer's
+# name. A worker only takes the jobs it accepts: "all" (one computer does everything), "links" (only
+# jobs made from a pasted link, for a home computer YouTube does not block) or "files" (everything
+# except those, for a hosting server that YouTube blocks).
+HOST = os.environ.get("CLIPPER_WORKER_HOST") or socket.gethostname()
+HEARTBEAT_PREFIX = "worker:"
+HEARTBEAT_KEY = f"{HEARTBEAT_PREFIX}{HOST}"
 HEARTBEAT_STALE = 12.0
+ORPHAN_STALE = 90.0  # a worker silent for this long is gone; the jobs it was running go back to the queue
+ACCEPTS = (config.secret("CLIPPER_WORKER_ACCEPTS") or "all").lower()
+WAITING_FOR_HOME = "Waiting for the home computer"
 ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
 VIEW_REFRESH_SECONDS = 30 * 60
 
@@ -45,8 +55,28 @@ def _pid_running(pid: int) -> bool:
     return code.value == 259  # STILL_ACTIVE
 
 
+def accepts(job: dict[str, Any]) -> bool:
+    """Whether this worker may take the job (see ACCEPTS)."""
+    from_link = bool(job.get("url")) and job["kind"] in ("auto", "video", "live")
+    if ACCEPTS == "links":
+        return from_link
+    if ACCEPTS == "files":
+        return not from_link
+    return True
+
+
+def requeue_orphans() -> int:
+    """Put jobs back in the queue when the worker running them has stopped (a redeployed server, a
+    computer that was switched off), whichever computer it was."""
+    now = time.time()
+    alive = {doc["_id"].removeprefix(HEARTBEAT_PREFIX) for doc in db.coll("kv").find(
+        {"_id": {"$regex": f"^{HEARTBEAT_PREFIX}"}}) if now - (doc.get("value") or {}).get("at", 0) <= ORPHAN_STALE}
+    return db.update_where("jobs", {"status": "running", "worker": {"$exists": True, "$nin": sorted(alive) + [None]}},
+                           {"status": "queued", "step": "Queued", "worker": None})
+
+
 def is_alive() -> bool:
-    """A recent heartbeat from a process that still exists."""
+    """A recent heartbeat from this computer's worker, from a process that still exists."""
     beat = db.kv_get(HEARTBEAT_KEY)
     if not beat or time.time() - beat.get("at", 0) > HEARTBEAT_STALE:
         return False
@@ -160,13 +190,15 @@ def _execute(job: dict[str, Any]) -> None:
 
 
 def claim(job_id: str) -> bool:
-    return db.claim_job(job_id)
+    return db.claim_job(job_id, HOST)
 
 
 def dispatch() -> None:
     for job in db.find("jobs", {"status": "queued"}, sort=[("created_at", 1)]):
+        if not accepts(job):
+            continue
         if job["kind"] in ("video", "more"):  # both use the graphics card and the disk heavily
-            if db.count("jobs", {"status": "running", "kind": {"$in": ["video", "more"]}}) \
+            if db.count("jobs", {"status": "running", "worker": HOST, "kind": {"$in": ["video", "more"]}}) \
                     or not claim(job["id"]):
                 continue
             heavy.submit(execute, job)
@@ -200,14 +232,20 @@ def main() -> None:
         print("A worker is already running.")
         return
     # Anything left "running" belonged to a worker that stopped: resume it.
-    db.update_where("jobs", {"status": "running"}, {"status": "queued"})
-    db.update_where("jobs", {"status": "stopping"}, {"status": "done"})
-    print(f"Worker started (pid {os.getpid()}). Data folder: {config.DATA}")
+    mine = {"$in": [None, HOST]}  # jobs this computer was running; other computers' jobs are theirs
+    db.update_where("jobs", {"status": "running", "worker": mine}, {"status": "queued"})
+    db.update_where("jobs", {"status": "stopping", "worker": mine}, {"status": "done"})
+    requeue_orphans()
+    print(f"Worker started on {HOST} (pid {os.getpid()}), takes: {ACCEPTS}. Data folder: {config.DATA}", flush=True)
     last_views = 0.0
     last_sweep = 0.0
+    last_orphans = 0.0
     while True:
         try:
-            db.kv_set(HEARTBEAT_KEY, {"at": time.time(), "pid": os.getpid()})
+            db.kv_set(HEARTBEAT_KEY, {"at": time.time(), "pid": os.getpid(), "host": HOST, "accepts": ACCEPTS})
+            if time.time() - last_orphans > 30:
+                last_orphans = time.time()
+                requeue_orphans()
             dispatch()
             running = db.count("jobs", {"status": {"$in": ["running", "queued"]}})
             keep_awake(running > 0)

@@ -1220,3 +1220,85 @@ def test_a_video_file_can_be_uploaded_instead_of_a_link(tmp_path, monkeypatch):
     db.delete("jobs", {"id": job["id"]})
     db.delete("uploads", {})
     _wipe_people()
+
+
+# ---- a home computer takes the YouTube-link jobs; the server takes the rest -------------------
+def _queued(job_id, **fields):
+    db.delete("jobs", {"id": job_id})
+    db.insert("jobs", {"id": job_id, "kind": "video", "status": "queued", "options": {}, "payload": {},
+                       "created_at": time.time(), "updated_at": time.time(), **fields})
+
+
+def test_workers_on_different_computers_take_different_jobs(monkeypatch):
+    from app import worker
+
+    link = {"kind": "video", "url": "https://youtu.be/abc"}
+    upload = {"kind": "video", "url": None}
+    for mode, takes_link, takes_upload in (("all", True, True), ("links", True, False), ("files", False, True)):
+        monkeypatch.setattr(worker, "ACCEPTS", mode)
+        assert worker.accepts(link) is takes_link and worker.accepts(upload) is takes_upload, mode
+    monkeypatch.setattr(worker, "ACCEPTS", "files")
+    assert worker.accepts({"kind": "upload", "url": None}) and worker.accepts({"kind": "render", "url": None})
+
+    started = []
+    monkeypatch.setattr(worker.heavy, "submit", lambda fn, job: started.append(job["id"]))
+    monkeypatch.setattr(worker.light, "submit", lambda fn, job: started.append(job["id"]))
+    monkeypatch.setattr(worker.threading, "Thread", lambda **kw: type("T", (), {"start": lambda self: started.append(kw["args"][0]["id"])})())
+    db.delete("jobs", {})
+    _queued("home-link", url="https://youtu.be/abc", created_at=time.time())
+    _queued("file-job", url=None, payload={"uploaded": True}, created_at=time.time() + 1)
+
+    monkeypatch.setattr(worker, "ACCEPTS", "files")  # the server
+    worker.dispatch()
+    assert started == ["file-job"], "the server leaves the link job for the home computer"
+    assert db.find_one("jobs", {"id": "file-job"})["worker"] == worker.HOST
+    assert db.find_one("jobs", {"id": "home-link"})["status"] == "queued"
+
+    started.clear()
+    monkeypatch.setattr(worker, "ACCEPTS", "links")  # the home computer, a different machine
+    monkeypatch.setattr(worker, "HOST", "home-pc")
+    worker.dispatch()
+    assert started == ["home-link"] and db.find_one("jobs", {"id": "home-link"})["status"] == "running"
+    assert db.find_one("jobs", {"id": "home-link"})["worker"] == "home-pc"
+    db.delete("jobs", {})
+
+
+def test_jobs_of_a_stopped_computer_go_back_to_the_queue(monkeypatch):
+    from app import worker
+
+    now = time.time()
+    db.delete("jobs", {})
+    db.kv_set("worker:alive-pc", {"at": now, "pid": os.getpid()})
+    db.kv_set("worker:gone-pc", {"at": now - 600, "pid": 2})
+    for job_id, host in (("on-alive", "alive-pc"), ("on-gone", "gone-pc"), ("on-unknown", "never-seen")):
+        _queued(job_id, status="running", worker=host, step="Transcribing speech")
+    _queued("legacy", status="running", step="Transcribing speech")  # from before workers had names
+
+    assert worker.requeue_orphans() == 2
+    assert db.find_one("jobs", {"id": "on-alive"})["status"] == "running", "a working computer keeps its job"
+    for job_id in ("on-gone", "on-unknown"):
+        job = db.find_one("jobs", {"id": job_id})
+        assert job["status"] == "queued" and job["worker"] is None and job["step"] == "Queued"
+    assert db.find_one("jobs", {"id": "legacy"})["status"] == "running"
+
+    monkeypatch.setattr(worker, "HOST", "alive-pc")
+    monkeypatch.setattr(worker, "HEARTBEAT_KEY", "worker:alive-pc")
+    assert worker.is_alive() is True, "each computer checks its own worker"
+    monkeypatch.setattr(worker, "HEARTBEAT_KEY", "worker:gone-pc")
+    assert worker.is_alive() is False
+    db.delete("jobs", {})
+    db.delete("kv", {"_id": {"$regex": "^worker:(alive|gone)-pc"}})
+
+
+def test_a_link_job_says_it_is_waiting_for_the_home_computer(client, monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "ACCEPTS", "files")
+    waiting = client.post("/api/jobs", json={"url": "https://youtu.be/q6fgVVmdpgY"}).json()
+    assert waiting["step"] == worker.WAITING_FOR_HOME
+    monkeypatch.setattr(worker, "ACCEPTS", "all")
+    normal = client.post("/api/jobs", json={"url": "https://youtu.be/q6fgVVmdpgY"}).json()
+    assert normal["step"] == "Queued"
+    for job in (waiting, normal):
+        client.post(f"/api/jobs/{job['id']}/stop")
+        client.delete(f"/api/jobs/{job['id']}")

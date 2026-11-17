@@ -144,11 +144,12 @@ def delete(name: str, filt: dict[str, Any]) -> int:
     return coll(name).delete_many(filt).deleted_count
 
 
-def claim_job(job_id: str) -> bool:
-    """Take a queued job for this worker. Only one caller can win."""
+def claim_job(job_id: str, worker: str | None = None) -> bool:
+    """Take a queued job for a worker. Only one caller, on any computer, can win."""
     now = time.time()
     return coll("jobs").find_one_and_update(
-        {"_id": job_id, "status": "queued"}, {"$set": {"status": "running", "updated_at": now}}) is not None
+        {"_id": job_id, "status": "queued"},
+        {"$set": {"status": "running", "updated_at": now, "worker": worker}}) is not None
 
 
 # ---- small key/value store (settings, worker heartbeat, trends) ---------------------------------

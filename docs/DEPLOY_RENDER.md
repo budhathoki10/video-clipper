@@ -86,6 +86,24 @@ In the project you use for sign-in:
 `PUBLIC_URL` is set automatically from Render's own address (`RENDER_EXTERNAL_URL`). Add a `PUBLIC_URL`
 environment variable yourself only if you use a custom domain (full address, no trailing slash).
 
+## 3b. YouTube links: let your own computer take them
+
+YouTube blocks most hosting servers, so a pasted link usually fails on Render. Your PC has a normal home
+address, and it can be a second worker for the same app. No payment is needed. Uploaded files and all
+other work stay on Render; only links go to your PC.
+
+1. In Render's Environment tab, add `CLIPPER_WORKER_ACCEPTS` = `files`. Link jobs then show "Waiting for
+   the home computer" until your PC takes them.
+2. On your PC, in `backend\.env`, make sure these have the **same values as Render**: `MONGODB_URI`,
+   `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY`, `BLOMP_BUCKET`, `APP_SECRET_KEY`, `NVIDIA_API_KEY`. Add
+   `CLIPPER_WORKER_ACCEPTS=links`. Do **not** set `PUBLIC_URL` on your PC.
+3. Run `scripts\home-worker.ps1`. It starts the worker in the background. It uses your graphics card, so
+   it is also faster than Render.
+4. While your PC is on and online, link jobs from every person are downloaded and clipped by it, and the
+   finished clips go to the same storage and database. When it is off, link jobs wait; file uploads still work.
+
+Nobody else needs to do anything. You can remove the `cookies.txt` secret file; it is not needed.
+
 ## 4. First sign-in
 
 Open the address and press **Continue with Google**. Then, in **Settings > Posting**, press
