@@ -86,14 +86,29 @@ In the project you use for sign-in:
 `PUBLIC_URL` is set automatically from Render's own address (`RENDER_EXTERNAL_URL`). Add a `PUBLIC_URL`
 environment variable yourself only if you use a custom domain (full address, no trailing slash).
 
-## 3b. YouTube links: let your own computer take them
+## 3b. YouTube links
 
-YouTube blocks most hosting servers, so a pasted link usually fails on Render. Your PC has a normal home
-address, and it can be a second worker for the same app. No payment is needed. Uploaded files and all
+YouTube blocks most hosting servers' own addresses, so a pasted link usually fails on Render. The server
+image handles this for everyone, with no payment and no computer of yours: at start it registers a free
+anonymous **Cloudflare WARP** device and sends the downloader's traffic through it (`docker/start.sh`), and
+the server's worker then takes link jobs itself. Look for this line in Render's Logs at start:
+`WARP proxy ready: YouTube links are downloaded through it.`
+
+- It is on by default. `CLIPPER_WARP=0` turns it off. If you set `YTDLP_PROXY` (your own proxy), that is used
+  instead of WARP.
+- Nothing guarantees YouTube accepts every WARP address. If links still fail, people can upload the file, and
+  you can add the home-computer worker below as a backup.
+- All of a downloaded video's data passes through Cloudflare WARP, which is meant for consumer use; check its
+  terms if you expect heavy use.
+
+### Backup: let your own computer take the link jobs
+
+Your PC has a normal home address, and it can be a second worker for the same app. Uploaded files and all
 other work stay on Render; only links go to your PC.
 
-1. In Render's Environment tab, add `CLIPPER_WORKER_ACCEPTS` = `files`. Link jobs then show "Waiting for
-   the home computer" until your PC takes them.
+1. (Only if you want Render to leave links to your PC) in Render's Environment tab set
+   `CLIPPER_WORKER_ACCEPTS` = `files` **and** `CLIPPER_WARP` = `0`. Otherwise skip this step: both computers
+   may take link jobs.
 2. On your PC, in `backend\.env`, make sure these have the **same values as Render**: `MONGODB_URI`,
    `BLOMP_ACCESS_KEY_ID`, `BLOMP_SECRET_ACCESS_KEY`, `BLOMP_BUCKET`, `APP_SECRET_KEY`, `NVIDIA_API_KEY`. Add
    `CLIPPER_WORKER_ACCEPTS=links`. Do **not** set `PUBLIC_URL` on your PC.
