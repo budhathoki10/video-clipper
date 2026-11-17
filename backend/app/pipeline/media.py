@@ -99,6 +99,27 @@ def network_options() -> dict[str, Any]:
     return opts
 
 
+def describe_formats(info: dict[str, Any]) -> str:
+    """One line for the server log: what YouTube offered. Contains no links or secrets."""
+    formats = info.get("formats") or []
+    parts = [f"{f.get('format_id')}:{f.get('ext')}:{f.get('height') or f.get('format_note') or '-'}"
+             f":{'v' if f.get('vcodec') not in (None, 'none') else ''}{'a' if f.get('acodec') not in (None, 'none') else ''}"
+             for f in formats[:20]]
+    return f"{len(formats)} formats offered" + (": " + " ".join(parts) if parts else "")
+
+
+def _log_offered_formats(url: str) -> None:
+    """When no usable format is found, say what YouTube did offer (usually only thumbnails when its
+    JavaScript puzzle could not be solved), so the cause shows in the server log."""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                               "ignore_no_formats_error": True, **network_options()}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        print(f"yt-dlp: {describe_formats(info)}", flush=True)
+    except Exception as exc:  # the diagnosis itself must never hide the real error
+        print(f"yt-dlp: could not list the offered formats ({type(exc).__name__})", flush=True)
+
+
 def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
             "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b", **network_options()}
@@ -106,6 +127,8 @@ def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except DownloadError as exc:
+        if "requested format is not available" in str(exc).lower():
+            _log_offered_formats(url)
         raise MediaError(_friendly(exc)) from None
     thumbs = info.get("thumbnails") or []
     return {

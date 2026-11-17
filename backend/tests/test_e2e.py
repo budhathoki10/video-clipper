@@ -1125,3 +1125,16 @@ def test_a_failed_job_is_written_to_the_log_and_hides_the_proxy(capsys, monkeypa
     assert db.find_one("jobs", {"id": "log1"})["status"] == "failed"
     assert "Job log1 (video) failed: YouTube is blocking this server" in capsys.readouterr().out
     db.delete("jobs", {"id": "log1"})
+
+
+def test_the_log_says_which_formats_youtube_offered():
+    from app.pipeline import media
+
+    line = media.describe_formats({"formats": [
+        {"format_id": "sb0", "ext": "mhtml", "format_note": "storyboard", "vcodec": "none", "acodec": "none"},
+        {"format_id": "137", "ext": "mp4", "height": 1080, "vcodec": "avc1", "acodec": "none"},
+        {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"},
+    ]})
+    assert line.startswith("3 formats offered") and "sb0:mhtml:storyboard:" in line and "137:mp4:1080:v" in line
+    assert "http" not in line, "no links in the log"
+    assert media.describe_formats({}) == "0 formats offered"
