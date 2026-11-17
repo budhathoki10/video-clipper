@@ -22,6 +22,11 @@ class MediaError(RuntimeError):
     """Raised with a message that is safe to show to the user."""
 
 
+class Blocked(MediaError):
+    """YouTube refused this computer (a bot check, a sign-in wall or no player response). Another
+    computer, such as a home PC, may still be able to download the same link."""
+
+
 def run(cmd: list[str], *, cwd: Path | None = None, timeout: float | None = None) -> str:
     proc = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
@@ -130,6 +135,13 @@ def _log_offered_formats(url: str) -> None:
         print(f"yt-dlp: could not list the offered formats ({type(exc).__name__})", flush=True)
 
 
+def _error(exc: Exception) -> MediaError:
+    lowered = str(exc).lower()
+    blocked = ("player response" in lowered or "http error 403" in lowered or "sign in to confirm" in lowered
+               or ("age" in lowered and "confirm" in lowered) or ("bot" in lowered and "not a" in lowered))
+    return (Blocked if blocked else MediaError)(_friendly(exc))
+
+
 def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
             "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b", **network_options()}
@@ -139,7 +151,7 @@ def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
     except DownloadError as exc:
         if "requested format is not available" in str(exc).lower():
             _log_offered_formats(url)
-        raise MediaError(_friendly(exc)) from None
+        raise _error(exc) from None
     thumbs = info.get("thumbnails") or []
     return {
         "id": info.get("id"),
@@ -188,7 +200,7 @@ def download(url: str, dest_dir: Path, *, max_height: int = 1080,
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except DownloadError as exc:
-        raise MediaError(_friendly(exc)) from None
+        raise _error(exc) from None
     files = sorted(dest_dir.glob("source.*"), key=lambda p: p.stat().st_size, reverse=True)
     files = [f for f in files if f.suffix.lower() in (".mp4", ".mkv", ".webm")]
     if not files:

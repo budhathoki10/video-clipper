@@ -98,6 +98,12 @@ the server's worker then takes link jobs itself. Look for this line in Render's 
   instead of WARP.
 - Nothing guarantees YouTube accepts every WARP address. If links still fail, people can upload the file, and
   you can add the home-computer worker below as a backup.
+- **If YouTube still blocks the server** (a bot check, a sign-in wall or "no player response"), the server hands
+  the link job to a **home computer** worker if one is running (the job shows "Waiting for the home
+  computer"). If none is running, the job fails at once with "…no home computer is available to take this
+  link. Upload the video file instead." A job waiting for a home computer that never comes fails after 10
+  minutes. A home computer is a worker started with `scripts\home-worker.ps1` (below); it is recognised
+  because it has no `PUBLIC_URL`.
 - All of a downloaded video's data passes through Cloudflare WARP, which is meant for consumer use; check its
   terms if you expect heavy use.
 
