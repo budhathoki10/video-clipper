@@ -10,11 +10,13 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode
 
@@ -25,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, config, db, keys, llm, runner, storage, worker, youtube
-from .pipeline import selection, trends
+from .pipeline import media, selection, trends
 
 ACTIVE = ("queued", "running", "stopping")
 MAX_ACTIVE_JOBS = 3  # videos one person may have in progress at once; there is no limit on their length
@@ -179,8 +181,9 @@ def _check_quota(request: Request) -> None:
 
 
 def queue_job(kind: str, *, user_id: str, url: str | None = None, options: dict | None = None,
-              payload: dict | None = None, title: str | None = None) -> dict[str, Any]:
-    job = {"id": db.new_id(), "kind": kind, "url": url, "status": "queued", "step": "Queued",
+              payload: dict | None = None, title: str | None = None,
+              job_id: str | None = None) -> dict[str, Any]:
+    job = {"id": job_id or db.new_id(), "kind": kind, "url": url, "status": "queued", "step": "Queued",
            "progress": 0, "title": title, "options": options or {}, "payload": payload or {},
            "created_at": time.time(), "updated_at": time.time(), "user_id": user_id}
     db.insert("jobs", job)
@@ -353,20 +356,141 @@ def create_job(body: JobCreate, request: Request) -> dict[str, Any]:
     url = body.url.strip()
     if not re.match(r"^https?://[^\s]+$", url):
         raise fail(422, "Paste a full link that starts with https://")
-    allowed = {k: config.prune_to(config.DEFAULT_SETTINGS[k], body.options[k])
-               for k in ("clip", "format", "captions", "overlay", "live") if isinstance(body.options.get(k), dict)}
-    if isinstance(body.options.get("max_minutes"), (int, float)) and body.options["max_minutes"] > 0:
-        allowed["max_minutes"] = body.options["max_minutes"]
+    options = _job_options(request, body.options)
+    _require_storage()
+    _check_quota(request)
+    job = queue_job("auto", url=url, options=options, user_id=_uid(request))
+    return _job_out(job)
+
+
+def _job_options(request: Request, sent: dict[str, Any]) -> dict[str, Any]:
+    """This person's settings with the options they chose for this video on top."""
+    allowed = {k: config.prune_to(config.DEFAULT_SETTINGS[k], sent[k])
+               for k in ("clip", "format", "captions", "overlay", "live") if isinstance(sent.get(k), dict)}
+    if isinstance(sent.get("max_minutes"), (int, float)) and sent["max_minutes"] > 0:
+        allowed["max_minutes"] = sent["max_minutes"]
     options = config.deep_merge(db.settings_for(_uid(request)), allowed)
     clip = options["clip"]
     if clip["min_sec"] > clip["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
+    return options
+
+
+def _require_storage() -> None:
     try:
         storage.require_when_hosted()
     except storage.StorageError as exc:
         raise fail(503, str(exc)) from None
+
+
+# ---- upload a video file instead of pasting a link ----------------------------
+# YouTube often refuses to give a hosting server its videos, so a person can upload the file. It
+# arrives in parts (a few MB each, so no single request is large or slow), is checked, and then
+# becomes an ordinary job that skips the download.
+UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_CHUNK_BYTES = 16 * 1024 * 1024
+MAX_OPEN_UPLOADS = 2
+UPLOAD_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi")
+
+
+class UploadStart(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    size: int = Field(gt=0)
+
+
+class UploadFinish(BaseModel):
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+def _upload_file(upload: dict[str, Any]) -> Path:
+    return config.DATA / "uploads" / upload["id"] / f"source{Path(upload['name']).suffix.lower()}"
+
+
+def _upload_for(request: Request, upload_id: str) -> dict[str, Any]:
+    upload = db.find_one("uploads", {"id": upload_id, **_mine(request)})
+    if not upload:
+        raise fail(404, "That upload does not exist.")
+    return upload
+
+
+@app.post("/api/uploads", status_code=201)
+def start_upload(body: UploadStart, request: Request) -> dict[str, Any]:
+    name = Path(body.name).name
+    if Path(name).suffix.lower() not in UPLOAD_SUFFIXES:
+        raise fail(422, "Upload a video file: mp4, mov, mkv, webm, m4v or avi.")
+    _require_storage()
     _check_quota(request)
-    job = queue_job("auto", url=url, options=options, user_id=_uid(request))
+    if db.count("uploads", {**_mine(request), "status": "uploading"}) >= MAX_OPEN_UPLOADS:
+        raise fail(429, "Two uploads are already in progress. Wait for one to finish.")
+    config.ensure_dirs()
+    if shutil.disk_usage(config.DATA).free < body.size + runner.MIN_FREE_BYTES:
+        raise fail(507, "The server does not have enough free space for this file right now. "
+                        "Try a smaller file, or try again later.")
+    upload = db.insert("uploads", {"user_id": _uid(request), "name": name, "size": body.size,
+                                   "received": 0, "status": "uploading", "created_at": time.time()})
+    target = _upload_file(upload)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"")
+    return {"id": upload["id"], "chunk_size": UPLOAD_CHUNK_BYTES}
+
+
+@app.put("/api/uploads/{upload_id}/chunk")
+async def upload_chunk(upload_id: str, offset: int, request: Request) -> dict[str, int]:
+    upload = await asyncio.to_thread(_upload_for, request, upload_id)
+    if upload["status"] != "uploading":
+        raise fail(409, "This upload is already finished.")
+    data = await request.body()
+    if not data or len(data) > MAX_CHUNK_BYTES:
+        raise fail(422, "That part is empty or too large.")
+    end = offset + len(data)
+    if end > upload["size"]:
+        raise fail(422, "More data arrived than the size of the file.")
+    target = _upload_file(upload)
+    if offset == upload["received"] and target.exists() and target.stat().st_size == offset:
+        def append() -> None:
+            with open(target, "ab") as handle:
+                handle.write(data)
+        await asyncio.to_thread(append)
+        await asyncio.to_thread(db.update, "uploads", upload_id, received=end)
+        return {"received": end}
+    if end == upload["received"]:  # the same part again after a dropped reply: already stored
+        return {"received": upload["received"]}
+    raise fail(409, "A part arrived out of order. Start the upload again.")
+
+
+@app.post("/api/uploads/{upload_id}/complete", status_code=201)
+def finish_upload(upload_id: str, body: UploadFinish, request: Request) -> dict[str, Any]:
+    upload = _upload_for(request, upload_id)
+    if upload["status"] != "uploading":
+        raise fail(409, "This upload is already finished.")
+    source = _upload_file(upload)
+    if upload["received"] != upload["size"] or not source.exists() or source.stat().st_size != upload["size"]:
+        raise fail(409, "The upload is incomplete. Try again.")
+    try:
+        info = media.probe(source)
+    except Exception:
+        info = {}
+    if not info.get("width") or not info.get("duration"):
+        shutil.rmtree(source.parent, ignore_errors=True)
+        db.delete("uploads", {"id": upload_id})
+        raise fail(422, "That file is not a video the server can read.")
+    options = _job_options(request, body.options)
+    _check_quota(request)
+
+    # Put the file where a downloaded video would be, with the details a link would have given,
+    # before the job exists, so the worker can never see it half ready.
+    job_id = db.new_id()
+    folder = runner.job_dir(job_id)
+    shutil.move(str(source), str(folder / f"source{source.suffix}"))
+    title = Path(upload["name"]).stem[:100] or "Uploaded video"
+    runner._save(folder / "meta.json", {
+        "id": job_id, "title": title, "channel": "", "channel_handle": "", "duration": info["duration"],
+        "live_status": "not_live", "thumbnail": "", "webpage_url": "", "heatmap": [], "category": "", "tags": []})
+    (folder / "download.done").write_text("ok")
+    job = queue_job("video", title=title, options=options, user_id=_uid(request), job_id=job_id,
+                    payload={"uploaded": True})
+    db.update("uploads", upload_id, status="done")
+    shutil.rmtree(source.parent, ignore_errors=True)
     return _job_out(job)
 
 

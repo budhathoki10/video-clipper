@@ -85,6 +85,19 @@ def sweep_orphans() -> int:
     return removed
 
 
+def sweep_uploads(max_age: float = 24 * 3600) -> int:
+    """Remove uploads that were started and never finished, and their records."""
+    root = config.DATA / "uploads"
+    removed = 0
+    if root.is_dir():
+        for folder in root.iterdir():
+            if folder.is_dir() and time.time() - folder.stat().st_mtime > max_age:
+                shutil.rmtree(folder, ignore_errors=True)
+                removed += 1
+    db.delete("uploads", {"status": "uploading", "created_at": {"$lt": time.time() - max_age}})
+    return removed
+
+
 def set_step(job_id: str, step: str, progress: float | None = None) -> None:
     values: dict[str, Any] = {"step": step}
     if progress is not None:
@@ -277,6 +290,8 @@ def process_video(job: dict[str, Any]) -> None:
     job_id, settings = job["id"], job["options"]
     folder = job_dir(job_id)
     fmt, ai = settings["format"], settings["ai"]
+    if not job.get("url") and not (folder / "meta.json").exists():  # an upload whose file is gone
+        raise RuntimeError("The uploaded file is no longer on the server. Upload it again.")
 
     set_step(job_id, "Reading video details", 0.01)
     meta = _load(folder / "meta.json")
@@ -291,9 +306,11 @@ def process_video(job: dict[str, Any]) -> None:
               duration=meta["duration"], thumbnail=meta["thumbnail"])
     check(job_id)
 
-    found = [p for p in folder.glob("source.*") if p.suffix.lower() in (".mp4", ".mkv", ".webm")]
+    found = [p for p in folder.glob("source.*") if p.suffix.lower() in SOURCE_SUFFIXES]
     if found and (folder / "download.done").exists():
         source = found[0]
+    elif not job.get("url"):  # an uploaded file that is no longer here cannot be fetched again
+        raise RuntimeError("The uploaded file is no longer on the server. Upload it again.")
     else:
         set_step(job_id, "Downloading video", 0.03)
         require_disk()

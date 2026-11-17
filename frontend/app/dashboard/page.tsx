@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronDown, Film, Link2 } from "lucide-react";
+import { ChevronDown, Film, Link2, Upload } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
@@ -18,6 +18,8 @@ export default function HomePage() {
   const settings = useApi<{ settings: Settings; secrets: SecretStatus }>("/api/settings");
   const system = useApi<SystemStatus>("/api/system", 10000);
   const input = useRef<HTMLInputElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState<{ name: string; percent: number } | null>(null);
   const [url, setUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -43,6 +45,42 @@ export default function HomePage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  function jobOptions() {
+    return overrides
+      ? { clip: { max_clips: overrides.max_clips, min_sec: overrides.min_sec, max_sec: overrides.max_sec }, format: { aspect: overrides.aspect, quality: overrides.quality } }
+      : {};
+  }
+
+  // A video file is sent in parts of a few MB, in order, so no single request is large or slow.
+  async function uploadFile(file: File) {
+    setError(null);
+    setUploading({ name: file.name, percent: 0 });
+    try {
+      const started = await api<{ id: string; chunk_size: number }>("/api/uploads", { method: "POST", json: { name: file.name, size: file.size } });
+      for (let offset = 0; offset < file.size; offset += started.chunk_size) {
+        const part = file.slice(offset, offset + started.chunk_size);
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await api(`/api/uploads/${started.id}/chunk?offset=${offset}`, { method: "PUT", body: part, headers: { "Content-Type": "application/octet-stream" } });
+            break;
+          } catch (err) {
+            if (attempt >= 3) throw err;
+            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          }
+        }
+        setUploading({ name: file.name, percent: Math.min(100, Math.round(((offset + part.size) / file.size) * 100)) });
+      }
+      await api(`/api/uploads/${started.id}/complete`, { method: "POST", json: { options: jobOptions() } });
+      toast("Uploaded. It keeps working if you close this page.");
+      void jobs.reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "The upload did not finish. Try again.");
+    } finally {
+      setUploading(null);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     const link = url.trim();
@@ -54,10 +92,7 @@ export default function HomePage() {
     setSubmitting(true);
     setError(null);
     try {
-      const options = overrides
-        ? { clip: { max_clips: overrides.max_clips, min_sec: overrides.min_sec, max_sec: overrides.max_sec }, format: { aspect: overrides.aspect, quality: overrides.quality } }
-        : {};
-      await api("/api/jobs", { method: "POST", json: { url: link, options } });
+      await api("/api/jobs", { method: "POST", json: { url: link, options: jobOptions() } });
       setUrl("");
       toast("Added. It keeps working if you close this page.");
       void jobs.reload();
@@ -86,7 +121,7 @@ export default function HomePage() {
           Clip a video or live stream
         </h1>
         <p className="mt-1 text-sm text-ink-2">
-          Paste a YouTube link. A finished video is cut into its strongest moments; a stream that is live right now is watched until it ends.
+          Paste a YouTube link or upload a video file. A finished video is cut into its strongest moments; a stream that is live right now is watched until it ends.
         </p>
 
         {system.data && !system.data.ai_ready && (
@@ -135,6 +170,32 @@ export default function HomePage() {
               {error}
             </p>
           )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-ink-2">
+            <input
+              ref={fileInput}
+              type="file"
+              accept="video/*,.mkv,.mov,.m4v,.avi"
+              className="sr-only"
+              aria-label="Video file"
+              tabIndex={-1}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void uploadFile(file);
+              }}
+            />
+            <Button type="button" variant="secondary" loading={uploading !== null} onClick={() => fileInput.current?.click()}>
+              <Upload aria-hidden /> Upload a video file
+            </Button>
+            {uploading ? (
+              <span role="status" className="flex min-w-0 items-center gap-2">
+                <span className="truncate">{uploading.name}</span>
+                <span className="num font-medium text-ink">{uploading.percent}%</span>
+              </span>
+            ) : (
+              <span className="text-ink-3">mp4, mov, mkv, webm or avi. Works when a link cannot be downloaded.</span>
+            )}
+          </div>
 
           <button
             type="button"

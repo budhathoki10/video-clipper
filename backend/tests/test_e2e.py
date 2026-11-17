@@ -1142,3 +1142,81 @@ def test_the_log_says_which_formats_youtube_offered():
     assert line.startswith("3 formats offered") and "sb0:mhtml:storyboard:" in line and "137:mp4:1080:v" in line
     assert "http" not in line, "no links in the log"
     assert media.describe_formats({}) == "0 formats offered"
+
+
+# ---- upload a video file instead of pasting a link -------------------------------------------
+def test_a_video_file_can_be_uploaded_instead_of_a_link(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    _wipe_people()
+    ann, bob = _person("ann@example.com", "a"), _person("bob@example.com", "b")
+    ann_c, bob_c = _browser(ann), _browser(bob)
+    video = tmp_path / "My clip.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=3",
+                    "-f", "lavfi", "-i", "sine=frequency=330:duration=3", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
+    data = video.read_bytes()
+    third = len(data) // 3
+    parts = [(0, data[:third]), (third, data[third:2 * third]), (2 * third, data[2 * third:])]
+
+    assert ann_c.post("/api/uploads", json={"name": "notes.txt", "size": 10}).status_code == 422, "only videos"
+    upload = ann_c.post("/api/uploads", json={"name": "My clip.mp4", "size": len(data)})
+    assert upload.status_code == 201 and upload.json()["chunk_size"] > 0
+    upload_id = upload.json()["id"]
+    assert ann_c.put(f"/api/uploads/{upload_id}/chunk?offset={third}", content=parts[1][1]).status_code == 409,         "parts must arrive in order"
+    for offset, part in parts:
+        sent = ann_c.put(f"/api/uploads/{upload_id}/chunk?offset={offset}", content=part)
+        assert sent.status_code == 200 and sent.json()["received"] == offset + len(part)
+    assert ann_c.put(f"/api/uploads/{upload_id}/chunk?offset={parts[2][0]}", content=parts[2][1]).status_code == 200,         "a part sent twice (a lost reply) is harmless"
+    assert bob_c.put(f"/api/uploads/{upload_id}/chunk?offset=0", content=b"x").status_code == 404
+    assert bob_c.post(f"/api/uploads/{upload_id}/complete", json={}).status_code == 404, "someone else's upload"
+
+    done = ann_c.post(f"/api/uploads/{upload_id}/complete", json={"options": {"clip": {"max_clips": 2}}})
+    assert done.status_code == 201, done.text
+    job = done.json()
+    assert job["kind"] == "video" and job["title"] == "My clip" and "user_id" not in job
+    stored = db.find_one("jobs", {"id": job["id"]})
+    assert stored["user_id"] == ann["id"] and stored["url"] is None and stored["options"]["clip"]["max_clips"] == 2
+    folder = config.JOBS_DIR / job["id"]
+    assert (folder / "source.mp4").read_bytes() == data and (folder / "download.done").exists()
+    meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+    assert meta["title"] == "My clip" and meta["duration"] > 2 and meta["channel"] == ""
+    assert not (config.DATA / "uploads" / upload_id).exists(), "the staging copy is gone"
+    assert job["id"] in {j["id"] for j in ann_c.get("/api/jobs").json()}
+    assert job["id"] not in {j["id"] for j in bob_c.get("/api/jobs").json()}
+
+    # The job starts from the file: it never tries to download or look the link up.
+    class Stop(Exception):
+        pass
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("an uploaded video must not be downloaded")
+
+    def reached_audio(*args, **kwargs):
+        raise Stop
+
+    monkeypatch.setattr(media, "download", forbidden)
+    monkeypatch.setattr(media, "fetch_info", forbidden)
+    monkeypatch.setattr(media, "extract_audio", reached_audio)
+    with pytest.raises(Stop):
+        runner.process_video(db.find_one("jobs", {"id": job["id"]}))
+    shutil.rmtree(folder)  # and if the file is gone it says so instead of trying to download
+    with pytest.raises(RuntimeError, match="Upload it again"):
+        runner.process_video(db.find_one("jobs", {"id": job["id"]}))
+
+    # A file that is not a video is refused when the upload completes.
+    fake = ann_c.post("/api/uploads", json={"name": "fake.mp4", "size": 5}).json()["id"]
+    ann_c.put(f"/api/uploads/{fake}/chunk?offset=0", content=b"hello")
+    refused = ann_c.post(f"/api/uploads/{fake}/complete", json={})
+    assert refused.status_code == 422 and "not a video" in refused.json()["detail"]
+    assert db.find_one("uploads", {"id": fake}) is None
+
+    # Unfinished uploads are cleaned up after a day.
+    old = ann_c.post("/api/uploads", json={"name": "old.mp4", "size": 5}).json()["id"]
+    db.update("uploads", old, created_at=time.time() - 3 * 86400)
+    os.utime(config.DATA / "uploads" / old, (time.time() - 3 * 86400,) * 2)
+    runner.sweep_uploads()
+    assert db.find_one("uploads", {"id": old}) is None and not (config.DATA / "uploads" / old).exists()
+
+    db.delete("jobs", {"id": job["id"]})
+    db.delete("uploads", {})
+    _wipe_people()
