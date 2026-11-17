@@ -150,8 +150,10 @@ def _execute(job: dict[str, Any]) -> None:
             db.update("jobs", job_id, status="done")
     except (media.MediaError, llm.LLMError, youtube.YouTubeError, storage.StorageError,
             RuntimeError) as exc:
+        print(f"Job {job_id} ({job['kind']}) failed: {str(exc)[:500]}", flush=True)
         db.update("jobs", job_id, status="failed", error=str(exc)[:500])
     except Exception as exc:
+        print(f"Job {job_id} ({job['kind']}) crashed:", flush=True)
         traceback.print_exc()
         db.update("jobs", job_id, status="failed",
                   error=f"Unexpected error: {type(exc).__name__}: {str(exc)[:300]}")

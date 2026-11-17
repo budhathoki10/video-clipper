@@ -1101,3 +1101,25 @@ def test_download_options_for_a_server_youtube_blocks(monkeypatch, tmp_path):
 
     blocked = media._friendly(Exception("[youtube] abc: Failed to extract any player response; please report this issue"))
     assert "blocking this server" in blocked and "github" not in blocked, "a plain message, not a bug-report request"
+
+
+def test_a_failed_job_is_written_to_the_log_and_hides_the_proxy(capsys, monkeypatch):
+    from app import worker
+    from app.pipeline import media
+
+    monkeypatch.setenv("YTDLP_PROXY", "http://user:secret-pass@proxy.example:8080")
+    message = media._friendly(Exception("ProxyError: cannot connect to http://user:secret-pass@proxy.example:8080"))
+    assert "secret-pass" not in message and "<proxy>" in message
+
+    db.delete("jobs", {"id": "log1"})
+    db.insert("jobs", {"id": "log1", "kind": "video", "status": "running", "options": {}, "payload": {},
+                       "created_at": time.time(), "updated_at": time.time()})
+
+    def blocked(job):
+        raise media.MediaError("YouTube is blocking this server from reading videos right now.")
+
+    monkeypatch.setitem(worker.HANDLERS, "video", blocked)
+    worker.execute(db.find_one("jobs", {"id": "log1"}))
+    assert db.find_one("jobs", {"id": "log1"})["status"] == "failed"
+    assert "Job log1 (video) failed: YouTube is blocking this server" in capsys.readouterr().out
+    db.delete("jobs", {"id": "log1"})

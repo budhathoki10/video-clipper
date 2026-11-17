@@ -59,6 +59,9 @@ def audio_duration(path: Path) -> float:
 
 def _friendly(exc: Exception) -> str:
     text = str(exc).replace("ERROR: ", "")
+    proxy = config.secret("YTDLP_PROXY")
+    if proxy:
+        text = text.replace(proxy, "<proxy>")  # the proxy address may hold a password
     lowered = text.lower()
     if "private video" in lowered:
         return "This video is private."
