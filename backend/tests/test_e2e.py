@@ -1081,3 +1081,23 @@ def test_working_files_and_the_source_video_are_kept_in_storage_not_on_the_serve
     assert not (config.JOBS_DIR / "keep1").exists()
     assert set(deleted) == {*files["artifacts"].values(), files["source"]}, "deleting a video deletes its stored files"
     db.delete("jobs", {"id": "keep1"})
+
+
+def test_download_options_for_a_server_youtube_blocks(monkeypatch, tmp_path):
+    from app.pipeline import media
+
+    monkeypatch.delenv("YTDLP_PROXY", raising=False)
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    assert media.network_options() == {}, "nothing changes unless a proxy or cookies are set"
+
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File" + chr(10), encoding="utf-8")
+    monkeypatch.setenv("YTDLP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(cookies))
+    opts = media.network_options()
+    assert opts["proxy"] == "http://proxy.example:8080"
+    assert Path(opts["cookiefile"]).read_text(encoding="utf-8").startswith("# Netscape"), "a copy of the cookies is used"
+    assert opts["cookiefile"] != str(cookies), "the original, which may be read-only, is never written"
+
+    blocked = media._friendly(Exception("[youtube] abc: Failed to extract any player response; please report this issue"))
+    assert "blocking this server" in blocked and "github" not in blocked, "a plain message, not a bug-report request"
