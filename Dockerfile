@@ -25,8 +25,19 @@ ENV PYTHONUNBUFFERED=1 \
 # ffmpeg renders the clips; fontconfig lets it find the caption fonts; nodejs lets yt-dlp solve
 # YouTube's challenges.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg fontconfig nodejs ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg fontconfig nodejs ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Cloudflare WARP without a VPN driver: wgcf registers a free anonymous device and wireproxy turns it
+# into a local SOCKS proxy that yt-dlp uses (see docker/start.sh).
+ARG WGCF_VERSION=2.3.1
+ARG WIREPROXY_VERSION=1.1.3
+RUN curl -fsSL -o /usr/local/bin/wgcf \
+      "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" \
+    && chmod +x /usr/local/bin/wgcf \
+    && curl -fsSL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_amd64.tar.gz" \
+       | tar -xz -C /usr/local/bin wireproxy \
+    && chmod +x /usr/local/bin/wireproxy
 
 WORKDIR /app/backend
 COPY backend/requirements.txt ./
@@ -35,10 +46,13 @@ RUN pip install -r requirements.txt && pip install "yt-dlp[default]"
 COPY backend/app ./app
 COPY backend/assets ./assets
 COPY --from=dashboard /build/frontend/out /app/frontend/out
+COPY docker/start.sh /app/start.sh
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
 # Scratch space for the video being processed. Everything lasting is in MongoDB and the storage.
 RUN mkdir -p /data
 EXPOSE 10000
 
-# Behind a hosting proxy the real scheme and client arrive in X-Forwarded-* headers.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers --forwarded-allow-ips='*' --no-access-log"]
+# docker/start.sh sets up the YouTube proxy, then runs uvicorn (with --proxy-headers, because behind a
+# hosting proxy the real scheme and client arrive in X-Forwarded-* headers).
+CMD ["/app/start.sh"]
