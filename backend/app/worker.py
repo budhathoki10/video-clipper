@@ -55,8 +55,44 @@ def _pid_running(pid: int) -> bool:
     return code.value == 259  # STILL_ACTIVE
 
 
+BLOCKED_NO_HOME = ("YouTube is blocking this server from reading videos right now, and no home computer is "
+                   "available to take this link. Upload the video file instead.")
+HOME_WAIT_SECONDS = 10 * 60  # a handed-over job waits this long for a home computer before it fails
+
+
+def home_worker_alive() -> bool:
+    """Whether a worker on a computer that is not a hosting server (a home PC) is running."""
+    now = time.time()
+    return any(now - (doc.get("value") or {}).get("at", 0) <= 30 and (doc.get("value") or {}).get("hosted") is False
+               for doc in db.coll("kv").find({"_id": {"$regex": f"^{HEARTBEAT_PREFIX}"}}))
+
+
+def hand_off(job: dict[str, Any]) -> bool:
+    """A hosting server that YouTube blocks passes a link job to a home computer's worker, once, if
+    one is running. Returns whether it did."""
+    payload = dict(job.get("payload") or {})
+    if payload.get("tried_server") or not config.public_url() or not home_worker_alive():
+        return False
+    payload["tried_server"] = True
+    runner.cleanup_partial(job["id"])
+    db.update("jobs", job["id"], status="queued", step=WAITING_FOR_HOME, error=None, worker=None, payload=payload)
+    print(f"Job {job['id']} ({job['kind']}) handed to a home computer.", flush=True)
+    return True
+
+
+def fail_stranded() -> int:
+    """Jobs handed to a home computer that never came fail with a clear message."""
+    if not config.public_url() or home_worker_alive():
+        return 0
+    return db.update_where("jobs", {"status": "queued", "payload.tried_server": True,
+                                    "updated_at": {"$lt": time.time() - HOME_WAIT_SECONDS}},
+                           {"status": "failed", "error": BLOCKED_NO_HOME})
+
+
 def accepts(job: dict[str, Any]) -> bool:
     """Whether this worker may take the job (see ACCEPTS)."""
+    if (job.get("payload") or {}).get("tried_server") and config.public_url():
+        return False  # the server already tried this one; it is waiting for a home computer
     from_link = bool(job.get("url")) and job["kind"] in ("auto", "video", "live")
     if ACCEPTS == "links":
         return from_link
@@ -178,6 +214,12 @@ def _execute(job: dict[str, Any]) -> None:
         row = db.find_one("jobs", {"id": job_id})
         if row and row["status"] == "stopping":
             db.update("jobs", job_id, status="done")
+    except media.Blocked as exc:
+        if hand_off(job):
+            return
+        message = BLOCKED_NO_HOME if config.public_url() and not (job.get("payload") or {}).get("tried_server") else str(exc)
+        print(f"Job {job_id} ({job['kind']}) failed: {message}", flush=True)
+        db.update("jobs", job_id, status="failed", error=message[:500])
     except (media.MediaError, llm.LLMError, youtube.YouTubeError, storage.StorageError,
             RuntimeError) as exc:
         print(f"Job {job_id} ({job['kind']}) failed: {str(exc)[:500]}", flush=True)
@@ -242,10 +284,12 @@ def main() -> None:
     last_orphans = 0.0
     while True:
         try:
-            db.kv_set(HEARTBEAT_KEY, {"at": time.time(), "pid": os.getpid(), "host": HOST, "accepts": ACCEPTS})
+            db.kv_set(HEARTBEAT_KEY, {"at": time.time(), "pid": os.getpid(), "host": HOST, "accepts": ACCEPTS,
+                                      "hosted": bool(config.public_url())})
             if time.time() - last_orphans > 30:
                 last_orphans = time.time()
                 requeue_orphans()
+                fail_stranded()
             dispatch()
             running = db.count("jobs", {"status": {"$in": ["running", "queued"]}})
             keep_awake(running > 0)

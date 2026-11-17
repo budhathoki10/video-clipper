@@ -1302,3 +1302,64 @@ def test_a_link_job_says_it_is_waiting_for_the_home_computer(client, monkeypatch
     for job in (waiting, normal):
         client.post(f"/api/jobs/{job['id']}/stop")
         client.delete(f"/api/jobs/{job['id']}")
+
+
+# ---- a blocked link goes to a home computer, or fails with a clear message ----------------------
+def test_only_blocks_are_blocks_not_every_download_error():
+    from app.pipeline import media
+
+    for text in ("Failed to extract any player response", "HTTP Error 403: Forbidden",
+                 "Sign in to confirm you're not a bot", "Sign in to confirm your age"):
+        assert isinstance(media._error(Exception(text)), media.Blocked), text
+    for text in ("Private video", "Video unavailable", "Unsupported URL: x"):
+        error = media._error(Exception(text))
+        assert isinstance(error, media.MediaError) and not isinstance(error, media.Blocked), text
+
+
+def test_a_blocked_server_hands_the_link_to_a_home_computer_or_says_so(monkeypatch):
+    from app import worker
+    from app.pipeline import media
+
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")  # this is the hosting server
+
+    def blocked(job):
+        raise media.Blocked("YouTube is blocking this server from reading videos right now.")
+
+    monkeypatch.setitem(worker.HANDLERS, "video", blocked)
+    db.delete("jobs", {})
+    db.delete("kv", {"_id": {"$regex": "^worker:"}})
+
+    # No home computer is running: the person is told straight away, and how to get on.
+    _queued("blocked-1", status="running", url="https://youtu.be/abc", worker=worker.HOST)
+    worker.execute(db.find_one("jobs", {"id": "blocked-1"}))
+    failed = db.find_one("jobs", {"id": "blocked-1"})
+    assert failed["status"] == "failed" and "Upload the video file" in failed["error"]
+
+    # A home computer is running: the job is handed over instead of failing.
+    db.kv_set("worker:home-pc", {"at": time.time(), "pid": os.getpid(), "hosted": False, "accepts": "links"})
+    _queued("blocked-2", status="running", url="https://youtu.be/abc", worker=worker.HOST)
+    worker.execute(db.find_one("jobs", {"id": "blocked-2"}))
+    waiting = db.find_one("jobs", {"id": "blocked-2"})
+    assert waiting["status"] == "queued" and waiting["step"] == worker.WAITING_FOR_HOME and waiting["worker"] is None
+    assert waiting["payload"]["tried_server"] is True and waiting["error"] is None
+    assert worker.accepts(waiting) is False, "the server does not take it back"
+    monkeypatch.delenv("PUBLIC_URL")
+    assert worker.accepts(waiting) is True, "the home computer does"
+
+    # If the home computer also fails, that is the answer; it is not passed around again.
+    monkeypatch.setitem(worker.HANDLERS, "video", lambda job: (_ for _ in ()).throw(media.Blocked("Still blocked.")))
+    db.update("jobs", "blocked-2", status="running")
+    worker.execute(db.find_one("jobs", {"id": "blocked-2"}))
+    assert db.find_one("jobs", {"id": "blocked-2"})["status"] == "failed"
+
+    # A job left waiting when the home computer is gone fails after a while, with the same message.
+    monkeypatch.setenv("PUBLIC_URL", "https://clipper.example.com")
+    db.delete("kv", {"_id": "worker:home-pc"})
+    _queued("stranded", url="https://youtu.be/abc", payload={"tried_server": True}, updated_at=time.time() - 3600)
+    _queued("fresh", url="https://youtu.be/abc", payload={"tried_server": True}, updated_at=time.time())
+    assert worker.fail_stranded() == 1
+    assert db.find_one("jobs", {"id": "stranded"})["status"] == "failed"
+    assert db.find_one("jobs", {"id": "stranded"})["error"] == worker.BLOCKED_NO_HOME
+    assert db.find_one("jobs", {"id": "fresh"})["status"] == "queued"
+    db.delete("jobs", {})
+    db.delete("kv", {"_id": {"$regex": "^worker:"}})
