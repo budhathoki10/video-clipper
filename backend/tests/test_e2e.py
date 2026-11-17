@@ -1099,6 +1099,10 @@ def test_download_options_for_a_server_youtube_blocks(monkeypatch, tmp_path):
     opts = media.network_options()
     assert opts["proxy"] == "http://proxy.example:8080"
     assert Path(opts["cookiefile"]).read_text(encoding="utf-8").startswith("# Netscape"), "a copy of the cookies is used"
+    assert opts["extractor_args"]["youtube"]["player_client"][0] == "tv", "cookies use clients that need no token"
+    monkeypatch.setenv("YTDLP_CLIENTS", "tv, android_vr")
+    assert media.network_options()["extractor_args"]["youtube"]["player_client"] == ["tv", "android_vr"]
+    monkeypatch.delenv("YTDLP_CLIENTS")
     assert opts["cookiefile"] != str(cookies), "the original, which may be read-only, is never written"
 
     blocked = media._friendly(Exception("[youtube] abc: Failed to extract any player response; please report this issue"))
