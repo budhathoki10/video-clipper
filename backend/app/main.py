@@ -40,7 +40,9 @@ def ensure_worker() -> bool:
         flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
                  | subprocess.DETACHED_PROCESS)
     config.DATA.mkdir(parents=True, exist_ok=True)
-    log = open(config.DATA / "worker.log", "a", encoding="utf-8")
+    # Hosted: the worker writes to the same place as the server, so its messages appear on the host's
+    # log page. On one computer it keeps its own log file.
+    log = None if config.public_url() else open(config.DATA / "worker.log", "a", encoding="utf-8")
     subprocess.Popen([sys.executable, "-m", "app.worker"], cwd=config.BACKEND, stdout=log,
                      stderr=log, stdin=subprocess.DEVNULL, creationflags=flags, close_fds=True)
     return True
