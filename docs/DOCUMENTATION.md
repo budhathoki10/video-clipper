@@ -75,6 +75,13 @@ Browser  ──►  FastAPI (app.main)  ──►  MongoDB  ◄──  Worker (a
   `runner.persist_job_files` uploads them and clears the folder, and `restore_job_files` brings them back
   for "more clips", re-rendering and hooks.
 
+- **Upload a video file.** Instead of a link, a person can upload a file (`POST /api/uploads`, then
+  `PUT /api/uploads/<id>/chunk?offset=N` for parts of up to 16 MB, then `POST /api/uploads/<id>/complete`).
+  The parts are written to a scratch folder under `CLIPPER_DATA_DIR/uploads`, checked with ffprobe, then moved
+  into a job folder with a `meta.json` and `download.done`, so the job (`kind: video`, no `url`) skips the
+  download and runs the normal pipeline. Unfinished uploads are removed after a day. The server checks free disk
+  space before accepting a file and keeps no length limit.
+
 ### Technology
 Python 3.11+ (developed on 3.13), FastAPI, MongoDB (pymongo), yt-dlp, ffmpeg (NVENC when available, x264
 otherwise), faster-whisper (GPU first, CPU fallback), boto3 (S3-compatible storage), Google API client

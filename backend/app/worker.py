@@ -214,6 +214,7 @@ def main() -> None:
             if time.time() - last_sweep > 3600:  # at start, then hourly
                 last_sweep = time.time()
                 light.submit(runner.sweep_orphans)
+                light.submit(runner.sweep_uploads)
             if time.time() - last_views > VIEW_REFRESH_SECONDS:
                 last_views = time.time()
                 light.submit(refresh_views)

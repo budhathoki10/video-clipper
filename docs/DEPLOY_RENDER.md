@@ -27,7 +27,9 @@ video and its working files are uploaded to storage and the folder is removed.
 - **Long videos.** There is no length limit. A long video needs temporary disk space on the server while
   it is processed; the app refuses to start a download when less than 5 GB is free.
 - **Downloads.** YouTube often blocks downloads from data-centre addresses. If a job fails with a download
-  error on Render but the same link works on your PC, that is the cause.
+  error on Render but the same link works on your PC, that is the cause. People can **upload a video
+  file** instead (button next to the link box); that never touches YouTube, so it cannot be blocked.
+  `YTDLP_PROXY` (a proxy address) and a `cookies.txt` secret file are optional helps for links.
 - **YouTube quota is shared.** Every upload by every person counts against the daily quota of your Google
   project (about six uploads a day by default). Ask Google for more quota before many people post.
 
