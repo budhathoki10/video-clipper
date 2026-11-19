@@ -205,8 +205,11 @@ job runs on the heavy lane (one at a time with `video`), and its progress is att
 - Output size is set by `aspect` and `quality` (the short side): 1080 gives 1080x1920 for 9:16.
 - **Layout** `auto` (default): `pipeline/facecam.py` samples 10 frames of the clip and looks for the
   creator's face with OpenCV's YuNet model (`assets/models`, MIT). A small face that stays in one place
-  near an edge is a **webcam**: a vertical clip is split, webcam on top (38%) and the middle of the action
-  below, with the hook title just under the webcam. A large steady face is a **speaker**: the crop follows
+  near an edge is a **webcam**: its whole overlay box is found (inside it the room stays still across
+  frames sampled up to 30 s around the clip; outside it the game moves), and a vertical clip is split:
+  the whole webcam on top (28-45% of the height, in the webcam's own shape) and the middle of the action
+  below, with the hook title just under the webcam. A small webcam is enlarged at most 3x (lanczos plus a
+  light sharpen) and centred over a blurred copy of itself rather than stretched into blocks. A large steady face is a **speaker**: the crop follows
   it sideways. Faces in the content (they move, or sit mid-frame) are ignored. With no such face, `auto`
   is `blur` at zoom 1, so nothing is cut off. `blur`: the whole frame over a blurred, darkened copy of
   itself (optional zoom; above 1 it crops the sides). `crop`: fill the frame. A source already in the
@@ -534,8 +537,8 @@ Windows notes: ffmpeg filter paths are kept relative (run with `cwd`); subproces
 - Live chat is not used as a signal.
 - The panel does not see the picture; a vision-capable model could judge frames.
 - Face following is per clip, not per moment: the webcam or speaker position is fixed for the whole clip,
-  and a webcam that moves mid-clip is not followed. The webcam crop is sized from the face (two face
-  widths), so a sliver of the game can show at its edge.
+  and a webcam that moves mid-clip is not followed. If the room behind the streamer moves, or the game
+  next to the webcam stays still, an edge can be missed; that side then uses the usual 16:9 webcam shape.
 - Clips cut from live recordings cannot be re-trimmed (recording removed after clipping).
 - One `video` job runs at a time.
 - Windows only for the helper scripts and notifications (the Python code is mostly portable).

@@ -29,6 +29,8 @@ def output_size(aspect: str, quality: int) -> tuple[int, int]:
     return _even(quality * a / b), _even(quality)
 
 
+# A light sharpen after enlarging a webcam, so it looks clean rather than smeared.
+SHARPEN = "unsharp=5:5:0.7:5:5:0.0"
 OLD_DEFAULT_ZOOM = 1.35  # the zoom that cut a streamer's webcam off the side of vertical clips
 
 
@@ -45,9 +47,10 @@ def plan_layout(source: Path, info: dict[str, Any], start: float, end: float,
     if layout == "crop":
         return {"mode": "crop"}
     if layout == "auto" and src_w and src_h:
-        face = facecam.find(source, start, end, src_w, src_h)
+        face = facecam.find(source, start, end, src_w, src_h, info.get("duration"))
         if face and face["kind"] == "cam" and height > width:
-            return {"mode": "split", "face": face}
+            return {"mode": "split", "face": face,
+                    "geometry": facecam.split_geometry(face, src_w, src_h, width, height)}
         if face and face["kind"] == "speaker":
             return {"mode": "speaker", "face": face}
     zoom = 1.0 if layout == "auto" else float(fmt.get("zoom", 1.0))
@@ -61,18 +64,27 @@ def _video_filter(src_w: int, src_h: int, width: int, height: int,
     if src_h and abs(src_w / src_h - width / height) < 0.05:
         plan = {"mode": "crop"}
     if plan["mode"] == "split":
-        g = facecam.split_geometry(plan["face"], src_w, src_h, width, height)
+        g = plan.get("geometry") or facecam.split_geometry(plan["face"], src_w, src_h, width, height)
         cw, ch, cx, cy = g["cam"]
         gw, gh, gx, gy = g["game"]
+        dw, dh = g["draw"]
+        top_h = g["top_h"]
+        if dw >= width:
+            cam = f"[cam0]crop={cw}:{ch}:{cx}:{cy},scale={width}:{top_h}:flags=lanczos,{SHARPEN},setsar=1[cam];"
+        else:  # a small webcam: drawn at most MAX_UPSCALE times, over a blurred copy of itself
+            cam = (f"[cam0]crop={cw}:{ch}:{cx}:{cy},split=2[cbg0][cfg0];"
+                   f"[cbg0]scale={_even(width / 4)}:{_even(top_h / 4)},boxblur=8:2,eq=brightness=-0.12,"
+                   f"scale={width}:{top_h},setsar=1[cbg];"
+                   f"[cfg0]scale={dw}:{dh}:flags=lanczos,{SHARPEN},setsar=1[cfg];"
+                   f"[cbg][cfg]overlay=(W-w)/2:(H-h)/2[cam];")
         chain = (
-            f"[0:v]fps={fps},split=2[cam0][game0];"
-            f"[cam0]crop={cw}:{ch}:{cx}:{cy},scale={width}:{g['top_h']},setsar=1[cam];"
-            f"[game0]crop={gw}:{gh}:{gx}:{gy},scale={width}:{g['bottom_h']},setsar=1[game];"
+            f"[0:v]fps={fps},split=2[cam0][game0];{cam}"
+            f"[game0]crop={gw}:{gh}:{gx}:{gy},scale={width}:{g['bottom_h']}:flags=lanczos,setsar=1[game];"
             f"[cam][game]vstack=inputs=2"
         )
     elif plan["mode"] == "speaker":
         cw, ch, cx, cy = facecam.speaker_crop(plan["face"], src_w, src_h, width, height)
-        chain = f"[0:v]fps={fps},crop={cw}:{ch}:{cx}:{cy},scale={width}:{height},setsar=1"
+        chain = f"[0:v]fps={fps},crop={cw}:{ch}:{cx}:{cy},scale={width}:{height}:flags=lanczos,setsar=1"
     elif plan["mode"] == "crop":
         chain = (f"[0:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
                  f"crop={width}:{height}")
@@ -131,7 +143,7 @@ def render_clip(*, source: Path, out_dir: Path, clip_id: str, start: float, end:
             credit=credit if overlay.get("credit", True) else "",
             title_all_clip=blur_vertical,
             # Split layout: the title goes just below the webcam panel, not over the face.
-            title_top=facecam.CAM_SHARE + 0.02 if plan["mode"] == "split" else None,
+            title_top=plan["geometry"]["top_h"] / height + 0.02 if plan["mode"] == "split" else None,
         ),
         encoding="utf-8",
     )
