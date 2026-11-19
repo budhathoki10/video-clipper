@@ -83,3 +83,40 @@ def test_without_a_face_the_whole_frame_is_kept(wide_video, tmp_path, monkeypatc
 def test_face_detection_runs_on_real_frames(wide_video):
     found = facecam.find(wide_video, 0, 3, 640, 360)
     assert found is None, "the test pattern has no face; the model loads and returns nothing"
+
+
+def _stream_frames(cam=(0, 150, 130, 85), count=14, size=(360, 640), seed=1):
+    """Frames like a stream: moving game everywhere, a still webcam box with a moving face inside."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    x, y, w, h = cam
+    room = rng.integers(40, 200, (h, w, 3), dtype=np.uint8)
+    frames = []
+    for i in range(count):
+        frame = rng.integers(0, 255, (*size, 3), dtype=np.uint8)  # the game changes every frame
+        frame[y:y + h, x:x + w] = room
+        frame[y + 25 + i % 3:y + 55 + i % 3, x + 50:x + 75] = rng.integers(0, 255, (30, 25, 3), dtype=np.uint8)
+        frames.append(frame)
+    return frames
+
+
+def test_the_whole_webcam_box_is_found_not_just_the_face():
+    frames = _stream_frames()
+    face = {"x": 50 / 640, "y": 175 / 360, "w": 25 / 640, "h": 30 / 360}
+    box = facecam.webcam_box(frames, face)
+    assert abs(box["x"] - 0) < 0.01 and abs(box["x"] + box["w"] - 130 / 640) < 0.02, box
+    assert abs(box["y"] - 150 / 360) < 0.02 and abs(box["y"] + box["h"] - 235 / 360) < 0.03, box
+
+
+def test_a_small_webcam_is_not_blown_up_into_blocks(wide_video, tmp_path, monkeypatch):
+    tiny = {"x": 0.02, "y": 0.05, "w": 0.03, "h": 0.06, "kind": "cam",
+            "box": {"x": 0.0, "y": 0.0, "w": 0.12, "h": 0.12}}
+    g = facecam.split_geometry(tiny, 1920, 1080, 1080, 1920)
+    assert g["draw"][0] <= g["cam"][0] * facecam.MAX_UPSCALE + 2 and g["draw"][0] < 1080, "drawn smaller, not stretched"
+    cw, ch, cx, cy = g["cam"]
+    assert cx + cw <= 0.12 * 1920 + 2 and cy + ch <= 0.12 * 1080 + 2, "the crop stays inside the webcam"
+    monkeypatch.setattr(facecam, "find", lambda *a, **k: tiny)
+    out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id="tiny", start=0, end=3,
+                             words=[], settings=_settings(), title="Hook")
+    assert out["layout"] == "split"
