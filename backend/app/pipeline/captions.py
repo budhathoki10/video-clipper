@@ -60,8 +60,9 @@ def group_words(words: list[dict[str, Any]], per_line: int) -> list[list[dict[st
 
 def build_ass(*, words: list[dict[str, Any]], width: int, height: int, duration: float,
               captions: dict[str, Any], title: str = "", credit: str = "",
-              title_all_clip: bool = False) -> str:
-    """`words` use clip-relative times in seconds."""
+              title_all_clip: bool = False, title_top: float | None = None) -> str:
+    """`words` use clip-relative times in seconds. `title_top` (a share of the height) moves the hook
+    title down, for example below a webcam panel so it does not cover the creator's face."""
     base = min(width, height)
     vertical = height > width
     cap_size = int(base * SIZE_FACTOR.get(captions.get("size", "medium"), 0.075))
@@ -76,6 +77,9 @@ def build_ass(*, words: list[dict[str, Any]], width: int, height: int, duration:
     else:
         cap_align, cap_margin = 2, int(height * (0.22 if vertical else 0.08))
     top = int(height * (0.10 if vertical else 0.07))
+    credit_top = int(top * 0.55)
+    if title_top is not None:
+        top, credit_top = int(height * title_top), int(height * 0.015)
 
     head = f"""[Script Info]
 ScriptType: v4.00+
@@ -88,7 +92,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Caption,{font},{cap_size},{primary},{primary},&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,{max(cap_size * 0.11, 2):.1f},{max(cap_size * 0.05, 1):.1f},{cap_align},{margin_x},{margin_x},{cap_margin},1
 Style: Title,{DEFAULT_FONT},{title_size},&H00111111,&H00111111,&H00FFFFFF,&H00FFFFFF,-1,0,0,0,100,100,0,0,3,{title_size * 0.28:.1f},0,8,{margin_x},{margin_x},{top},1
-Style: Credit,Arial,{credit_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,{max(credit_size * 0.08, 1.5):.1f},0,8,{margin_x},{margin_x},{int(top * 0.55)},1
+Style: Credit,Arial,{credit_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,{max(credit_size * 0.08, 1.5):.1f},0,8,{margin_x},{margin_x},{credit_top},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

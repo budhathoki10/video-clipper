@@ -203,8 +203,15 @@ job runs on the heavy lane (one at a time with `video`), and its progress is att
 
 ### Rendering (`pipeline/render.py`)
 - Output size is set by `aspect` and `quality` (the short side): 1080 gives 1080x1920 for 9:16.
-- **Layout** `blur`: the whole frame is placed over a blurred, darkened copy of itself (with an
-  optional zoom); `crop`: fill the frame. A source already in the target shape is just scaled.
+- **Layout** `auto` (default): `pipeline/facecam.py` samples 10 frames of the clip and looks for the
+  creator's face with OpenCV's YuNet model (`assets/models`, MIT). A small face that stays in one place
+  near an edge is a **webcam**: a vertical clip is split, webcam on top (38%) and the middle of the action
+  below, with the hook title just under the webcam. A large steady face is a **speaker**: the crop follows
+  it sideways. Faces in the content (they move, or sit mid-frame) are ignored. With no such face, `auto`
+  is `blur` at zoom 1, so nothing is cut off. `blur`: the whole frame over a blurred, darkened copy of
+  itself (optional zoom; above 1 it crops the sides). `crop`: fill the frame. A source already in the
+  target shape is just scaled. Settings saved with the old default (`blur` at zoom 1.35, which cut corner
+  webcams off) are treated as `auto` (`render.plan_layout`).
 - Captions, hook and credit come from one ASS file burned in with the `ass` filter. ffmpeg runs with the
   clip folder as its working directory so filter arguments are bare names (Windows drive letters and
   spaces break filter strings). Bundled fonts are copied to `<clips>/_fonts` under a lock (clips render
@@ -268,7 +275,7 @@ Stored as overrides in `kv['settings']`, merged over the defaults (`deep_merge`)
 | Section | Keys |
 |---|---|
 | `clip` | `min_sec`, `max_sec`, `max_clips`, `min_score`, `context_sec` |
-| `format` | `aspect` (9:16/16:9/1:1), `layout` (blur/crop), `zoom`, `quality`, `fps`, `source_quality` |
+| `format` | `aspect` (9:16/16:9/1:1), `layout` (auto/blur/crop), `zoom`, `quality`, `fps`, `source_quality` |
 | `captions` | `enabled`, `font`, `size`, `color`, `highlight`, `position`, `words_per_line`, `uppercase`, `language` |
 | `overlay` | `hook_title`, `credit` |
 | `ai` | `provider`, `models{provider: model}`, `panel_size`, `whisper_model` |
@@ -526,7 +533,9 @@ Windows notes: ffmpeg filter paths are kept relative (run with `cwd`); subproces
 
 - Live chat is not used as a signal.
 - The panel does not see the picture; a vision-capable model could judge frames.
-- Face-following reframing is not implemented (layouts are blur or centre crop).
+- Face following is per clip, not per moment: the webcam or speaker position is fixed for the whole clip,
+  and a webcam that moves mid-clip is not followed. The webcam crop is sized from the face (two face
+  widths), so a sliver of the game can show at its edge.
 - Clips cut from live recordings cannot be re-trimmed (recording removed after clipping).
 - One `video` job runs at a time.
 - Windows only for the helper scripts and notifications (the Python code is mostly portable).

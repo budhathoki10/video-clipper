@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import captions, media
+from . import captions, facecam, media
 
 ASPECTS = {"9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1)}
 FONTS_DIR = Path(__file__).resolve().parents[2] / "assets" / "fonts"
@@ -29,15 +29,55 @@ def output_size(aspect: str, quality: int) -> tuple[int, int]:
     return _even(quality * a / b), _even(quality)
 
 
+OLD_DEFAULT_ZOOM = 1.35  # the zoom that cut a streamer's webcam off the side of vertical clips
+
+
+def plan_layout(source: Path, info: dict[str, Any], start: float, end: float,
+                width: int, height: int, fmt: dict[str, Any]) -> dict[str, Any]:
+    """How to fit the source into the output: "crop", "blur", "split" (webcam on top, action below) or
+    "speaker" (a crop that follows the speaker's face). "auto" looks for the creator's face first."""
+    src_w, src_h = info["width"], info["height"]
+    if src_h and abs(src_w / src_h - width / height) < 0.05:
+        return {"mode": "crop"}  # same shape: nothing to fit
+    layout = fmt.get("layout", "auto")
+    if layout == "blur" and float(fmt.get("zoom", 1.0)) == OLD_DEFAULT_ZOOM:
+        layout = "auto"  # settings saved before "auto" existed: use the face-aware layout
+    if layout == "crop":
+        return {"mode": "crop"}
+    if layout == "auto" and src_w and src_h:
+        face = facecam.find(source, start, end, src_w, src_h)
+        if face and face["kind"] == "cam" and height > width:
+            return {"mode": "split", "face": face}
+        if face and face["kind"] == "speaker":
+            return {"mode": "speaker", "face": face}
+    zoom = 1.0 if layout == "auto" else float(fmt.get("zoom", 1.0))
+    return {"mode": "blur", "zoom": zoom}
+
+
 def _video_filter(src_w: int, src_h: int, width: int, height: int,
-                  fmt: dict[str, Any], ass_name: str) -> str:
+                  fmt: dict[str, Any], ass_name: str, plan: dict[str, Any] | None = None) -> str:
     fps = int(fmt.get("fps", 30))
-    same_shape = src_h and abs(src_w / src_h - width / height) < 0.05
-    if fmt.get("layout") == "crop" or same_shape:
+    plan = plan or {"mode": "crop" if fmt.get("layout") == "crop" else "blur", "zoom": fmt.get("zoom", 1.0)}
+    if src_h and abs(src_w / src_h - width / height) < 0.05:
+        plan = {"mode": "crop"}
+    if plan["mode"] == "split":
+        g = facecam.split_geometry(plan["face"], src_w, src_h, width, height)
+        cw, ch, cx, cy = g["cam"]
+        gw, gh, gx, gy = g["game"]
+        chain = (
+            f"[0:v]fps={fps},split=2[cam0][game0];"
+            f"[cam0]crop={cw}:{ch}:{cx}:{cy},scale={width}:{g['top_h']},setsar=1[cam];"
+            f"[game0]crop={gw}:{gh}:{gx}:{gy},scale={width}:{g['bottom_h']},setsar=1[game];"
+            f"[cam][game]vstack=inputs=2"
+        )
+    elif plan["mode"] == "speaker":
+        cw, ch, cx, cy = facecam.speaker_crop(plan["face"], src_w, src_h, width, height)
+        chain = f"[0:v]fps={fps},crop={cw}:{ch}:{cx}:{cy},scale={width}:{height},setsar=1"
+    elif plan["mode"] == "crop":
         chain = (f"[0:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
                  f"crop={width}:{height}")
     else:
-        zoom = min(max(float(fmt.get("zoom", 1.35)), 1.0), 2.0)
+        zoom = min(max(float(plan.get("zoom", 1.0)), 1.0), 2.0)
         bw, bh = _even(width / 4), _even(height / 4)
         chain = (
             f"[0:v]fps={fps},split=2[bg0][fg0];"
@@ -79,7 +119,8 @@ def render_clip(*, source: Path, out_dir: Path, clip_id: str, start: float, end:
         {"w": w["w"], "s": w["s"] - start, "e": w["e"] - start}
         for w in words if w["e"] > start and w["s"] < end
     ]
-    blur_vertical = height > width and fmt.get("layout") != "crop"
+    plan = plan_layout(source, info, start, end, width, height, fmt)
+    blur_vertical = height > width and plan["mode"] == "blur"
     overlay = settings.get("overlay", {})
     ass_name, video_name, thumb_name = f"{clip_id}.ass", f"{clip_id}.mp4", f"{clip_id}.jpg"
     (out_dir / ass_name).write_text(
@@ -89,6 +130,8 @@ def render_clip(*, source: Path, out_dir: Path, clip_id: str, start: float, end:
             title=title if overlay.get("hook_title", True) else "",
             credit=credit if overlay.get("credit", True) else "",
             title_all_clip=blur_vertical,
+            # Split layout: the title goes just below the webcam panel, not over the face.
+            title_top=facecam.CAM_SHARE + 0.02 if plan["mode"] == "split" else None,
         ),
         encoding="utf-8",
     )
@@ -97,7 +140,7 @@ def render_clip(*, source: Path, out_dir: Path, clip_id: str, start: float, end:
     media.run(
         ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
          "-i", str(source), "-filter_complex",
-         _video_filter(info["width"], info["height"], width, height, fmt, ass_name),
+         _video_filter(info["width"], info["height"], width, height, fmt, ass_name, plan),
          "-map", "[v]", "-map", "0:a:0?", *media.video_encoder(),
          "-af", LOUDNESS, "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
          "-movflags", "+faststart", video_name],
@@ -109,4 +152,4 @@ def render_clip(*, source: Path, out_dir: Path, clip_id: str, start: float, end:
         cwd=out_dir, timeout=120,
     )
     return {"file": video_name, "thumb": thumb_name, "width": width, "height": height,
-            "duration": duration}
+            "duration": duration, "layout": plan["mode"]}

@@ -27,7 +27,7 @@ const toDraft = (clip: Clip): Draft => ({
   start: clip.start,
   end: clip.end,
   aspect: clip.format.aspect ?? "9:16",
-  layout: clip.format.layout ?? "blur",
+  layout: clip.format.layout ?? "auto",
   quality: clip.format.quality ?? 1080,
   captions: clip.captions.enabled ?? true,
 });
@@ -401,6 +401,7 @@ function ClipDetail() {
                 <Field label="Layout" hint="Applies when the source shape differs from the format.">
                   {(p) => (
                     <select {...p} className="field" value={draft.layout} onChange={(e) => edit("layout", e.target.value as Draft["layout"])}>
+                      <option value="auto">Automatic: creator's face on top when there is a webcam</option>
                       <option value="blur">Whole frame on a blurred background</option>
                       <option value="crop">Crop to fill the screen</option>
                     </select>
