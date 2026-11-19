@@ -188,9 +188,15 @@ job runs on the heavy lane (one at a time with `video`), and its progress is att
   from the second (`stream_urls`).
 - Each finished segment is transcribed and measured against the stream's own running baseline
   (robust z-scores of loudness and speaking rate, plus a bonus for excited phrases).
-- When the score passes `live.sensitivity` and the cooldown allows, the segments around the peak are
-  concatenated, the AI trims them with the same selection code, and the clip is rendered while
-  recording continues.
+- When `live.sustain_segments` segments in a row (default 2) pass `live.sensitivity` and the cooldown
+  allows, the segments around the strongest of them are concatenated, the AI trims them with the same
+  selection code, and the clip is rendered while recording continues. One loud segment alone never
+  starts a clip.
+- Every clip (finished video, "more clips" and live) is widened by `clip.context_sec` (default 5) on each
+  side after the AI picks it (`runner.add_context`), so a 20 s moment becomes a 30 s clip. A vertical
+  clip that fit in a Short is never pushed past 3 minutes. For finished videos, candidate moments are
+  ranked by a 15-second average of the score (`signals.SUSTAIN_SEC`), so a single bang does not outrank
+  a lasting moment.
 - Old segments are deleted as they age out, so disk use stays flat for any stream length. If the stream
   address expires, the recorder restarts (up to 40 times). Stopping a live job sets `stopping`; the
   watcher ends cleanly and keeps its clips.
@@ -261,12 +267,12 @@ Stored as overrides in `kv['settings']`, merged over the defaults (`deep_merge`)
 
 | Section | Keys |
 |---|---|
-| `clip` | `min_sec`, `max_sec`, `max_clips`, `min_score` |
+| `clip` | `min_sec`, `max_sec`, `max_clips`, `min_score`, `context_sec` |
 | `format` | `aspect` (9:16/16:9/1:1), `layout` (blur/crop), `zoom`, `quality`, `fps`, `source_quality` |
 | `captions` | `enabled`, `font`, `size`, `color`, `highlight`, `position`, `words_per_line`, `uppercase`, `language` |
 | `overlay` | `hook_title`, `credit` |
 | `ai` | `provider`, `models{provider: model}`, `panel_size`, `whisper_model` |
-| `live` | `sensitivity`, `segment_sec`, `lookback_sec`, `cooldown_sec`, `min_score`, `quality` |
+| `live` | `sensitivity`, `sustain_segments`, `segment_sec`, `lookback_sec`, `cooldown_sec`, `min_score`, `quality` |
 | `trends` | `queries[]`, `match_topic`, `per_query`, `refresh_hours` |
 | `posting` | `privacy`, `hashtags`, `credit` |
 

@@ -9,8 +9,25 @@ import { JobRow } from "@/components/job-row";
 import { EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
 import { formatDuration, useApi, type Clip, type Job } from "@/lib/api";
 
-/** Excitement per recorded segment, with the trigger line. A bar above the line starts a clip. */
-function Activity({ scores, threshold }: { scores: number[]; threshold: number }) {
+/** Indexes of bars that belong to a run of at least `sustain` bars in a row above the threshold. */
+function sustainedBars(scores: number[], threshold: number, sustain: number): Set<number> {
+  const marked = new Set<number>();
+  let start = -1;
+  scores.forEach((score, i) => {
+    if (score >= threshold) {
+      if (start < 0) start = i;
+      if (i - start + 1 >= sustain) for (let j = start; j <= i; j++) marked.add(j);
+    } else {
+      start = -1;
+    }
+  });
+  return marked;
+}
+
+/** Excitement per recorded segment, with the trigger line. Only a run of `sustain` bars in a row
+ * above the line starts a clip; a single spike is shown lighter. */
+function Activity({ scores, threshold, sustain }: { scores: number[]; threshold: number; sustain: number }) {
+  const runs = sustainedBars(scores, threshold, sustain);
   const W = 600;
   const H = 72;
   const max = Math.max(threshold * 1.6, ...scores, 1);
@@ -19,10 +36,10 @@ function Activity({ scores, threshold }: { scores: number[]; threshold: number }
   const slot = W / 60;
   const offset = 60 - scores.length;
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="h-[72px] w-full" role="img" aria-label={`Excitement over the last ${scores.length} segments. ${scores.filter((s) => s >= threshold).length} went over the clip threshold.`}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="h-[72px] w-full" role="img" aria-label={`Excitement over the last ${scores.length} segments. ${runs.size} were part of a run long enough to start a clip.`}>
       {scores.map((score, i) => {
         const top = y(Math.max(score, min));
-        return <rect key={i} x={(i + offset) * slot + 1} y={top} width={slot - 2} height={Math.max(H - top, 1)} rx={1} className={score >= threshold ? "fill-accent" : "fill-line-strong"} />;
+        return <rect key={i} x={(i + offset) * slot + 1} y={top} width={slot - 2} height={Math.max(H - top, 1)} rx={1} className={runs.has(i) ? "fill-accent" : score >= threshold ? "fill-accent/35" : "fill-line-strong"} />;
       })}
       <line x1={0} x2={W} y1={y(threshold)} y2={y(threshold)} className="stroke-ink-3" strokeWidth={1} strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />
     </svg>
@@ -54,9 +71,12 @@ function LiveSession({ job, clips, onChange }: { job: Job; clips: Clip[]; onChan
         </dl>
         {scores.length > 0 ? (
           <>
-            <Activity scores={scores} threshold={job.payload?.threshold ?? 2.2} />
+            <Activity scores={scores} threshold={job.payload?.threshold ?? 2.2} sustain={job.payload?.sustain ?? 1} />
             <p className="mt-1.5 text-xs text-ink-3">
-              Excitement in the last {scores.length} segments (loudness, speaking speed, hype phrases). Bars above the dashed line start a clip.
+              Excitement in the last {scores.length} segments (loudness, speaking speed, hype phrases).{" "}
+              {(job.payload?.sustain ?? 1) > 1
+                ? `${job.payload?.sustain} bars in a row above the dashed line start a clip; a single spike (lighter) does not.`
+                : "Bars above the dashed line start a clip."}
             </p>
           </>
         ) : (

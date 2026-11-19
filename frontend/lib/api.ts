@@ -24,6 +24,7 @@ export interface Job {
     clips?: number;
     scores?: number[];
     threshold?: number;
+    sustain?: number;
     last_error?: string;
     storage_warning?: string;
   } | null;
@@ -94,7 +95,7 @@ export interface Post {
 export type Provider = "nvidia" | "anthropic" | "gemini" | "ollama";
 
 export interface Settings {
-  clip: { min_sec: number; max_sec: number; max_clips: number; min_score: number };
+  clip: { min_sec: number; max_sec: number; max_clips: number; min_score: number; context_sec: number };
   format: {
     aspect: "9:16" | "16:9" | "1:1";
     layout: "blur" | "crop";
@@ -123,6 +124,7 @@ export interface Settings {
   };
   live: {
     sensitivity: number;
+    sustain_segments: number;
     segment_sec: number;
     lookback_sec: number;
     cooldown_sec: number;

@@ -208,6 +208,26 @@ def restore_job_files(job_id: str, *, source: bool = False) -> Path | None:
     return None
 
 
+SHORTS_MAX_SEC = 180  # YouTube treats a vertical video up to 3 minutes long as a Short
+
+
+def add_context(pick: dict[str, Any], *, duration: float, settings: dict[str, Any]) -> dict[str, Any]:
+    """Widen a chosen moment by `clip.context_sec` on each side (within the video), so a viewer sees
+    what led up to it and how it ended. A 20 s moment becomes a 30 s clip with the default 5 s.
+    A vertical clip that fit in a Short is never pushed past 3 minutes by the padding."""
+    context = max(float(settings["clip"].get("context_sec", 0) or 0), 0.0)
+    if context <= 0 or pick.get("context_sec") is not None:
+        return pick
+    start = max(float(pick["start"]) - context, 0.0)
+    end = float(pick["end"]) + context
+    if duration:
+        end = min(end, float(duration))
+    if settings["format"].get("aspect") == "9:16" and pick["end"] - pick["start"] <= SHORTS_MAX_SEC < end - start:
+        extra = (end - start) - SHORTS_MAX_SEC
+        start, end = start + extra / 2, end - extra / 2
+    return {**pick, "start": round(start, 2), "end": round(end, 2), "context_sec": context}
+
+
 def credit_line(meta: dict[str, Any]) -> str:
     name = meta.get("channel_handle") or meta.get("channel") or ""
     return f"Credit: {name}" if name else ""
@@ -363,6 +383,7 @@ def process_video(job: dict[str, Any]) -> None:
             cands=cands, transcript=transcript, meta=meta, clip_cfg=clip_cfg,
             trends=trend_brief, signal=score,
         )
+        picks = [add_context(pick, duration=meta["duration"], settings=settings) for pick in picks]
         for pick in picks:
             pick["id"] = db.new_id()
         _save(folder / "selection.json", picks)
@@ -440,6 +461,7 @@ def process_more(job: dict[str, Any]) -> None:
             on_progress=cancel_aware(job["id"], lambda p: set_step(job["id"], "Downloading the video again", 0.25 + 0.3 * p)))
     check(job["id"])
 
+    picks = [add_context(pick, duration=float(meta.get("duration") or 0), settings=settings) for pick in picks]
     for index, pick in enumerate(picks):
         pick["id"] = db.new_id()
         if payload.get("label_part"):  # continue the numbering from the clips already made
