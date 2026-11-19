@@ -1549,3 +1549,40 @@ def test_a_live_clip_needs_excitement_several_segments_in_a_row(monkeypatch):
     feed(11, 4.0)
     assert session.pending and session.pending["idx"] == 11, "two segments in a row do"
     assert session.pending_peak["score"] == 4.0, "the clip is centred on the strongest of them"
+
+
+def test_deleting_a_video_never_deletes_its_clips(client, monkeypatch):
+    deleted = []
+    monkeypatch.setattr(storage, "delete", lambda ref: deleted.append(ref))
+    for job_id in ("keep-job", "empty-job"):
+        db.delete("jobs", {"id": job_id})
+    now = time.time()
+    db.insert("jobs", {"id": "keep-job", "kind": "video", "status": "done", "url": "https://youtu.be/x", "title": "Long video",
+                       "options": {}, "payload": {}, "created_at": now, "updated_at": now,
+                       "files": {"artifacts": {"transcript.json": "s3:t"}, "source": "s3:source", "source_name": "source.mp4"}})
+    db.insert("jobs", {"id": "empty-job", "kind": "video", "status": "failed", "url": "https://youtu.be/y", "title": "No clips",
+                       "options": {}, "payload": {}, "created_at": now, "updated_at": now,
+                       "files": {"artifacts": {}, "source": "s3:other-source"}})
+    for number in (1, 2):
+        db.insert("clips", {"id": f"keep-clip-{number}", "job_id": "keep-job", "status": "ready", "title": f"Clip {number}",
+                            "start": 10.0, "end": 40.0, "file": f"s3:clip{number}", "thumb": f"s3:thumb{number}",
+                            "options": {}, "created_at": now})
+
+    assert client.delete("/api/jobs/keep-job").status_code == 204
+    assert {c["id"] for c in db.find("clips", {"job_id": "keep-job"})} == {"keep-clip-1", "keep-clip-2"}, "the clips stay"
+    assert db.find_one("clips", {"id": "keep-clip-1"})["file"] == "s3:clip1"
+    assert not {"s3:clip1", "s3:clip2", "s3:thumb1", "s3:thumb2", "s3:t"} & set(filter(None, deleted)), \
+        "no clip file and no working file is deleted from storage"
+    assert "s3:source" in deleted, "only the big downloaded video is removed"
+    ids = [j["id"] for j in client.get("/api/jobs").json()]
+    assert "keep-job" not in ids, "the video is gone from the list"
+    assert {c["id"] for c in client.get("/api/clips").json()} >= {"keep-clip-1", "keep-clip-2"}, "the clips are still listed"
+    assert client.get("/api/clips/keep-clip-1").status_code == 200
+
+    deleted.clear()
+    assert client.delete("/api/jobs/empty-job").status_code == 204
+    assert db.find_one("jobs", {"id": "empty-job"}) is None, "a video that made no clips is deleted outright"
+    assert "s3:other-source" in deleted
+    for clip_id in ("keep-clip-1", "keep-clip-2"):
+        db.delete("clips", {"id": clip_id})
+    db.delete("jobs", {"id": "keep-job"})

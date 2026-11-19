@@ -26,6 +26,7 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
   const more = job.more;
   const moreActive = more?.status === "queued" || more?.status === "running" || more?.status === "stopping";
   const canMakeMore = job.kind === "video" && job.status === "done" && (job.clip_count ?? 0) > 0 && !moreActive;
+  const hasClips = (job.clip_count ?? 0) > 0;
   const active = job.status === "queued" || job.status === "running";
   const live = job.kind === "live";
   const status = live && job.status === "running" ? { label: "Live", tone: "bad" as const } : STATUS[job.status];
@@ -164,18 +165,20 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
       <Dialog
         open={confirm}
         onClose={() => setConfirm(false)}
-        title="Delete this video and its clips?"
+        title={hasClips ? "Remove this video from the list?" : "Delete this video?"}
         footer={
           <>
             <Button onClick={() => setConfirm(false)}>Keep</Button>
-            <Button variant="danger" loading={busy === "delete"} onClick={() => act("delete", `/api/jobs/${job.id}`, "DELETE", "Deleted.")}>
-              Delete
+            <Button variant={hasClips ? "primary" : "danger"} loading={busy === "delete"} onClick={() => act("delete", `/api/jobs/${job.id}`, "DELETE", hasClips ? "Removed. Your clips are kept." : "Deleted.")}>
+              {hasClips ? "Remove video" : "Delete"}
             </Button>
           </>
         }
       >
         <p className="text-sm text-ink-2">
-          The downloaded source and {job.clip_count || 0} rendered {job.clip_count === 1 ? "clip" : "clips"} will be deleted. Videos already posted to YouTube stay there.
+          {hasClips
+            ? `Only the video entry and its downloaded copy are removed. Its ${job.clip_count} ${job.clip_count === 1 ? "clip stays" : "clips stay"} in Clips and in storage. You can delete a clip from its own page.`
+            : "This video made no clips. Its entry and any downloaded copy will be deleted."}
         </p>
       </Dialog>
     </li>
