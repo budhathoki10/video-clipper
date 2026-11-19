@@ -1109,6 +1109,58 @@ def test_download_options_for_a_server_youtube_blocks(monkeypatch, tmp_path):
     assert "blocking this server" in blocked and "github" not in blocked, "a plain message, not a bug-report request"
 
 
+def test_youtube_is_asked_several_ways_before_giving_up(monkeypatch, tmp_path):
+    from app.pipeline import media
+
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File" + chr(10), encoding="utf-8")
+    helper = tmp_path / "generate_once.js"
+    helper.write_text("// token helper", encoding="utf-8")
+    monkeypatch.delenv("YTDLP_CLIENTS", raising=False)
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    monkeypatch.delenv("BGUTIL_SCRIPT_PATH", raising=False)
+    assert media.attempt_modes() == ["plain"]
+
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(cookies))
+    assert media.attempt_modes() == ["cookies", "plain"], "without the token helper, cookies go first"
+
+    monkeypatch.setenv("BGUTIL_SCRIPT_PATH", str(helper))
+    assert media.attempt_modes() == ["token+cookies", "token", "cookies"]
+    first = media.network_options("token+cookies")
+    assert first["extractor_args"]["youtube"]["player_client"] == ["default", "mweb"]
+    assert first["extractor_args"]["youtubepot-bgutilscript"]["script_path"] == [str(helper)]
+    assert "cookiefile" in first
+    anonymous = media.network_options("token")
+    assert "cookiefile" not in anonymous and anonymous["extractor_args"]["youtube"]["player_client"] == ["default", "mweb"]
+    assert media.network_options("cookies")["extractor_args"]["youtube"]["player_client"][0] == "tv"
+    assert "player_skip" not in first["extractor_args"]["youtube"], "the token request needs the web page"
+
+    tried = []
+
+    def ask(options):
+        tried.append(options)
+        if len(tried) < 3:
+            error = media.Blocked("YouTube is blocking this server")
+            error.retry_other_mode = True
+            raise error
+        return "got it"
+
+    assert media._attempts(ask) == "got it" and len(tried) == 3, "a block moves on to the next way"
+
+    tried.clear()
+
+    def private(options):
+        tried.append(options)
+        raise media._error(Exception("ERROR: [youtube] abc: Private video. Sign in if you've been granted access"))
+
+    with pytest.raises(media.MediaError, match="private"):
+        media._attempts(private)
+    assert len(tried) == 1, "a private video is the answer straight away, not retried"
+
+    assert media._error(Exception("Requested format is not available")).retry_other_mode
+    assert not media._error(Exception("Private video")).retry_other_mode
+
+
 def test_a_failed_job_is_written_to_the_log_and_hides_the_proxy(capsys, monkeypatch):
     from app import worker
     from app.pipeline import media

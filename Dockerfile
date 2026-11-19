@@ -12,7 +12,22 @@ RUN npm ci --no-fund --no-audit
 COPY frontend/ ./
 RUN npm run build
 
-# --- 2. the app -------------------------------------------------------------------------------
+# --- 2. the YouTube proof-of-origin token helper ---------------------------------------------
+# YouTube asks browser-type clients for a token that proves the request came from a real player. This
+# small Node program makes one on demand (it is what yt-dlp's bgutil plugin calls). The plugin and the
+# program must be the same version.
+FROM node:22-slim AS tokens
+ARG BGUTIL_VERSION=2.0.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${BGUTIL_VERSION} https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
+    && cd /opt/bgutil-provider/server \
+    && npm ci --no-audit --no-fund \
+    && npx tsc \
+    && npm prune --omit=dev --no-audit --no-fund
+
+# --- 3. the app -------------------------------------------------------------------------------
 FROM python:3.13-slim
 
 # CPU-only host: skip the GPU attempt and use the CPU transcription model straight away.
@@ -22,11 +37,15 @@ ENV PYTHONUNBUFFERED=1 \
     CLIPPER_DATA_DIR=/data \
     CLIPPER_FORCE_CPU=1
 
-# ffmpeg renders the clips; fontconfig lets it find the caption fonts; nodejs lets yt-dlp solve
-# YouTube's challenges.
+# ffmpeg renders the clips; fontconfig lets it find the caption fonts.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg fontconfig nodejs ca-certificates curl \
+    && apt-get install -y --no-install-recommends ffmpeg fontconfig ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Node runs YouTube's JavaScript challenges for yt-dlp, and the token helper built above.
+COPY --from=tokens /usr/local/bin/node /usr/local/bin/node
+COPY --from=tokens /opt/bgutil-provider /opt/bgutil-provider
+ENV BGUTIL_SCRIPT_PATH=/opt/bgutil-provider/server/build/generate_once.js
 
 # Cloudflare WARP without a VPN driver: wgcf registers a free anonymous device and wireproxy turns it
 # into a local SOCKS proxy that yt-dlp uses (see docker/start.sh).
@@ -41,7 +60,8 @@ RUN curl -fsSL -o /usr/local/bin/wgcf \
 
 WORKDIR /app/backend
 COPY backend/requirements.txt ./
-RUN pip install -r requirements.txt && pip install "yt-dlp[default]"
+ARG BGUTIL_VERSION=2.0.2
+RUN pip install -r requirements.txt && pip install "yt-dlp[default]" "bgutil-ytdlp-pot-provider==${BGUTIL_VERSION}"
 
 COPY backend/app ./app
 COPY backend/assets ./assets
