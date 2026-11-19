@@ -3,10 +3,10 @@
 import { AlertCircle } from "lucide-react";
 import Link from "next/link";
 
-import { clipScore, formatDuration, mediaUrl, type Clip } from "@/lib/api";
+import { clipScore, formatDuration, mediaUrl, type ClipSummary } from "@/lib/api";
 import { Score, Spinner } from "./ui";
 
-export function ClipCard({ clip }: { clip: Clip }) {
+export function ClipCard({ clip }: { clip: ClipSummary }) {
   return (
     <Link
       href={`/clip/?id=${clip.id}`}

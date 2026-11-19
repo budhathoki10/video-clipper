@@ -2,12 +2,14 @@
 
 import { Radio } from "lucide-react";
 import Link from "next/link";
-import { useMemo } from "react";
+import { useState } from "react";
 
-import { CLIP_GRID, ClipCard } from "@/components/clip-card";
+import { CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
 import { JobRow } from "@/components/job-row";
+import { Pagination } from "@/components/pagination";
 import { EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
-import { formatDuration, useApi, type Clip, type Job } from "@/lib/api";
+import { formatDuration, type ClipSummary, type Job, type Page } from "@/lib/api";
+import { usePagedApi } from "@/lib/pagination";
 
 /** Indexes of bars that belong to a run of at least `sustain` bars in a row above the threshold. */
 function sustainedBars(scores: number[], threshold: number, sustain: number): Set<number> {
@@ -46,7 +48,10 @@ function Activity({ scores, threshold, sustain }: { scores: number[]; threshold:
   );
 }
 
-function LiveSession({ job, clips, onChange }: { job: Job; clips: Clip[]; onChange: () => void }) {
+function LiveSession({ job, onChange }: { job: Job; onChange: () => void }) {
+  const [page, setPage] = useState(1);
+  const clips = usePagedApi<Page<ClipSummary>>("/api/clips", page, 6, { job_id: job.id }, 4000);
+  const clipPage = clips.data ?? clips.previousData;
   const scores = job.payload?.scores ?? [];
   const running = job.status === "running";
   return (
@@ -62,7 +67,7 @@ function LiveSession({ job, clips, onChange }: { job: Job; clips: Clip[]; onChan
           </div>
           <div>
             <dt className="text-xs text-ink-3">Clips made</dt>
-            <dd className="num text-md font-semibold">{clips.length}</dd>
+            <dd className="num text-md font-semibold">{clipPage?.total ?? job.clip_count ?? 0}</dd>
           </div>
           <div>
             <dt className="text-xs text-ink-3">Clip threshold</dt>
@@ -84,13 +89,17 @@ function LiveSession({ job, clips, onChange }: { job: Job; clips: Clip[]; onChan
         )}
         {job.payload?.last_error && <p className="mt-2 text-xs text-warn-ink">Last clip attempt failed: {job.payload.last_error}</p>}
       </div>
-      {clips.length > 0 && (
-        <div className="border-t border-line-subtle p-4">
-          <div className={CLIP_GRID}>
-            {clips.map((clip) => (
-              <ClipCard key={clip.id} clip={clip} />
-            ))}
-          </div>
+      {(clips.error || clips.loading || !!clipPage?.total) && (
+        <div id={`stream-clips-${job.id}`} className="scroll-mt-16 border-t border-line-subtle p-4 md:scroll-mt-4">
+          {clips.error ? <ErrorState message={clips.error} onRetry={clips.reload} /> : clips.loading ? <ClipGridSkeleton /> : (
+            <div className={CLIP_GRID}>
+              {clips.data?.items.map((clip) => (
+                <ClipCard key={clip.id} clip={clip} />
+              ))}
+            </div>
+          )}
+          <Pagination data={clips.error ? null : clipPage} label={`Clips for ${job.title || "this stream"}`}
+            onPageChange={setPage} loading={clips.loading} className="mt-3" anchorId={`stream-clips-${job.id}`} />
         </div>
       )}
     </article>
@@ -98,22 +107,17 @@ function LiveSession({ job, clips, onChange }: { job: Job; clips: Clip[]; onChan
 }
 
 export default function LivePage() {
-  const jobs = useApi<Job[]>("/api/jobs?kind=live", 2500);
-  const clips = useApi<Clip[]>("/api/clips", 4000);
-  const byJob = useMemo(() => {
-    const map = new Map<string, Clip[]>();
-    for (const clip of clips.data ?? []) map.set(clip.job_id, [...(map.get(clip.job_id) ?? []), clip]);
-    return map;
-  }, [clips.data]);
+  const [page, setPage] = useState(1);
+  const jobs = usePagedApi<Page<Job>>("/api/jobs", page, 3, { kind: "live" }, 2500);
 
   return (
-    <>
+    <div id="stream-list" className="scroll-mt-16 md:scroll-mt-4">
       <PageHeader title="Live" description="Streams being watched. Clips are cut while the stream is still running, about one to two minutes after the moment." />
       {jobs.error ? (
         <ErrorState message={jobs.error} onRetry={jobs.reload} />
       ) : jobs.loading && !jobs.data ? (
         <SkeletonRows rows={2} height="h-40" />
-      ) : (jobs.data ?? []).length === 0 ? (
+      ) : !jobs.data?.items.length ? (
         <EmptyState
           icon={<Radio />}
           title="No streams are being watched"
@@ -126,11 +130,12 @@ export default function LivePage() {
         />
       ) : (
         <div className="flex flex-col gap-4">
-          {jobs.data!.map((job) => (
-            <LiveSession key={job.id} job={job} clips={byJob.get(job.id) ?? []} onChange={() => void jobs.reload()} />
+          {jobs.data.items.map((job) => (
+            <LiveSession key={job.id} job={job} onChange={() => void jobs.reload()} />
           ))}
         </div>
       )}
-    </>
+      <Pagination data={jobs.data ?? (jobs.loading ? jobs.previousData : null)} label="Live streams" onPageChange={setPage} loading={jobs.loading} className="mt-4" anchorId="stream-list" />
+    </div>
   );
 }

@@ -5,8 +5,10 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
+import { Pagination } from "@/components/pagination";
 import { Badge, Button, Dialog, ErrorState, Field, Notice, Score, Section, SkeletonRows, Spinner, Toggle, useToast } from "@/components/ui";
-import { API_URL, api, formatDuration, mediaUrl, useApi, type Clip, type Panel, type Settings, type SystemStatus } from "@/lib/api";
+import { API_URL, api, formatDuration, mediaUrl, useApi, type Clip, type Page, type Panel, type Post, type Settings, type SystemStatus } from "@/lib/api";
+import { usePagedApi } from "@/lib/pagination";
 
 type Draft = {
   title: string;
@@ -119,7 +121,11 @@ function ClipDetail() {
   const id = useSearchParams().get("id");
   const router = useRouter();
   const toast = useToast();
-  const { data: clip, error, loading, reload, setData } = useApi<Clip>(id ? `/api/clips/${id}` : null, 3000);
+  const { data: clip, error, loading, reload, setData } = useApi<Clip>(id ? `/api/clips/${encodeURIComponent(id)}?include_posts=false` : null, 3000);
+  const [postPosition, setPostPosition] = useState({ id, page: 1 });
+  const postPage = postPosition.id === id ? postPosition.page : 1;
+  const setPostPage = (page: number) => setPostPosition({ id, page });
+  const posts = usePagedApi<Page<Post>>(clip ? "/api/posts" : null, postPage, 5, { clip_id: id ?? "" }, 4000);
   const system = useApi<SystemStatus>("/api/system");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -196,6 +202,8 @@ function ClipDetail() {
       toast(postOpen === "schedule" ? "Scheduled. Uploading to YouTube now." : "Posting. Uploading to YouTube now.");
       setPostOpen(null);
       void reload();
+      if (postPage === 1) void posts.reload();
+      else setPostPage(1);
     } catch (err) {
       toast(err instanceof Error ? err.message : "Could not post.", "bad");
     } finally {
@@ -320,9 +328,11 @@ function ClipDetail() {
               To post from here, <Link href="/settings/#youtube" className="underline underline-offset-2">connect your YouTube channel</Link>. Until then, download the clip and upload it by hand.
             </Notice>
           )}
-          {(clip.posts ?? []).length > 0 && (
+          {posts.error ? <ErrorState message={posts.error} onRetry={posts.reload} /> : posts.loading ? (
+            <SkeletonRows rows={2} />
+          ) : !!posts.data?.items.length && (
             <ul className="panel divide-y divide-line-subtle">
-              {clip.posts!.map((p) => (
+              {posts.data.items.map((p) => (
                 <li key={p.id} className="flex flex-wrap items-center gap-2 px-4 py-2.5 text-sm">
                   <Badge tone={p.status === "failed" ? "bad" : p.status === "published" ? "ok" : "accent"}>{p.status[0].toUpperCase() + p.status.slice(1)}</Badge>
                   <span className="min-w-0 flex-1 truncate text-ink-2">
@@ -337,6 +347,7 @@ function ClipDetail() {
               ))}
             </ul>
           )}
+          <Pagination data={posts.data ?? (posts.loading ? posts.previousData : null)} label="Clip posts" onPageChange={setPostPage} loading={posts.loading} />
 
           <Section title="Details" description="Title and description are used when you post. Changing the hook, trim or format renders the clip again.">
             <div className="flex flex-col gap-4">

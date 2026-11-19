@@ -1,10 +1,12 @@
 "use client";
 
 import { ExternalLink, RefreshCw, TrendingUp } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
+import { Pagination } from "@/components/pagination";
 import { Button, EmptyState, ErrorState, Notice, PageHeader, SkeletonRows, useToast } from "@/components/ui";
-import { api, formatCount, formatDuration, timeAgo, useApi, type Trends } from "@/lib/api";
+import { api, formatCount, formatDuration, timeAgo, type Trends } from "@/lib/api";
+import { usePagedApi } from "@/lib/pagination";
 
 function Card({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -40,23 +42,20 @@ function Rows({ items }: { items: string[] }) {
 
 export default function TrendsPage() {
   const toast = useToast();
-  const trends = useApi<Trends>("/api/trends", 4000);
+  const [page, setPage] = useState(1);
+  const trends = usePagedApi<Trends>("/api/trends", page, 10, {}, 4000);
   const [starting, setStarting] = useState(false);
-  const [shown, setShown] = useState(10);
-  const data = trends.data?.data;
+  const snapshot = trends.loading ? trends.previousData : trends.data;
+  const data = snapshot?.data;
   const profile = data?.profile ?? {};
-  const refreshing = starting || (trends.data?.refreshing ?? false);
+  const refreshing = starting || (snapshot?.refreshing ?? false);
 
-  const stats = useMemo(() => {
-    const videos = data?.videos ?? [];
-    const lengths = videos.map((v) => v.duration).filter(Boolean).sort((a, b) => a - b);
-    return [
-      { label: "Best clip length", value: profile.ideal_length_sec ? `${profile.ideal_length_sec} s` : "–" },
-      { label: "Videos read", value: String(videos.length) },
-      { label: "Most views", value: formatCount(videos[0]?.views) },
-      { label: "Typical length", value: lengths.length ? formatDuration(lengths[Math.floor(lengths.length / 2)]) : "–" },
-    ];
-  }, [data, profile.ideal_length_sec]);
+  const stats = [
+    { label: "Best clip length", value: profile.ideal_length_sec ? `${profile.ideal_length_sec} s` : "–" },
+    { label: "Videos read", value: String(data?.videos.total ?? 0) },
+    { label: "Most views", value: formatCount(data?.most_views) },
+    { label: "Typical length", value: data?.typical_length ? formatDuration(data.typical_length) : "–" },
+  ];
 
   async function refresh() {
     setStarting(true);
@@ -86,7 +85,7 @@ export default function TrendsPage() {
       />
       {trends.error ? (
         <ErrorState message={trends.error} onRetry={trends.reload} />
-      ) : trends.loading && !trends.data ? (
+      ) : trends.loading && !data ? (
         <SkeletonRows rows={6} />
       ) : !data ? (
         <div className="flex flex-col gap-3">
@@ -134,10 +133,14 @@ export default function TrendsPage() {
             )}
           </div>
 
-          <section className="panel overflow-x-auto" aria-labelledby="videos-heading">
+          <section className="panel scroll-mt-16 md:scroll-mt-4" id="trend-results" aria-labelledby="videos-heading">
             <h2 id="videos-heading" className="border-b border-line-subtle px-4 py-2.5 text-xs font-medium text-ink-2">
               Top results read
             </h2>
+            {trends.loading ? <div className="p-4"><SkeletonRows rows={5} /></div> : !data.videos.items.length ? (
+              <p className="p-4 text-sm text-ink-2">No video results were saved. Refresh to read YouTube again.</p>
+            ) : (
+            <div className="overflow-x-auto">
             <table className="w-full min-w-[560px] text-sm">
               <thead className="border-b border-line-subtle text-xs text-ink-3">
                 <tr>
@@ -148,7 +151,7 @@ export default function TrendsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-line-subtle">
-                {data.videos.slice(0, shown).map((video) => (
+                {data.videos.items.map((video) => (
                   <tr key={video.id} className="hover:bg-raised">
                     <td className="max-w-[420px] px-4 py-2">
                       <a href={video.url} target="_blank" rel="noreferrer" className="group flex items-center gap-1.5">
@@ -164,11 +167,9 @@ export default function TrendsPage() {
                 ))}
               </tbody>
             </table>
-            {data.videos.length > shown && (
-              <div className="border-t border-line-subtle p-2 text-center">
-                <Button variant="ghost" onClick={() => setShown(data.videos.length)}>Show all {data.videos.length}</Button>
-              </div>
+            </div>
             )}
+            <Pagination data={data.videos} label="Trend results" onPageChange={setPage} loading={trends.loading} className="border-t border-line-subtle px-4 py-3" anchorId="trend-results" />
           </section>
         </div>
       )}

@@ -2,12 +2,13 @@
 
 import { ArrowDown, ArrowUp, ExternalLink, Send } from "lucide-react";
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 
+import { Pagination } from "@/components/pagination";
 import { Badge, Button, EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
-import { formatCount, timeAgo, useApi, type Post } from "@/lib/api";
+import { formatCount, timeAgo, type Page, type Post } from "@/lib/api";
+import { usePagedApi } from "@/lib/pagination";
 
-const PAGE_SIZE = 20;
 type SortKey = "created_at" | "views" | "title";
 type Filter = "all" | Post["status"];
 
@@ -15,41 +16,32 @@ const TONE = { uploading: "accent", scheduled: "warn", published: "ok", failed: 
 const LABEL = { uploading: "Uploading", scheduled: "Scheduled", published: "Published", failed: "Failed" } as const;
 
 export default function PostsPage() {
-  const posts = useApi<Post[]>("/api/posts", 5000);
   const [filter, setFilter] = useState<Filter>("all");
-  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "created_at", dir: -1 });
-  const [page, setPage] = useState(0);
-
-  const rows = useMemo(() => {
-    const list = (posts.data ?? []).filter((p) => filter === "all" || p.status === filter);
-    return list.sort((a, b) => {
-      const x = sort.key === "title" ? a.title.localeCompare(b.title) : (a[sort.key] ?? -1) - (b[sort.key] ?? -1);
-      return x * sort.dir;
-    });
-  }, [posts.data, filter, sort]);
-  const pages = Math.max(Math.ceil(rows.length / PAGE_SIZE), 1);
-  const current = Math.min(page, pages - 1);
-  const visible = rows.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE);
+  const [sort, setSort] = useState<{ key: SortKey; direction: "asc" | "desc" }>({ key: "created_at", direction: "desc" });
+  const [page, setPage] = useState(1);
+  const posts = usePagedApi<Page<Post> & { unfiltered_total: number }>("/api/posts", page, 20, {
+    ...(filter === "all" ? {} : { status: filter }), sort: sort.key, direction: sort.direction,
+  }, 5000);
 
   const header = (key: SortKey, label: string, align = "text-left") => {
     const active = sort.key === key;
     return (
-      <th scope="col" aria-sort={active ? (sort.dir === 1 ? "ascending" : "descending") : "none"} className={`px-4 py-2 font-medium ${align}`}>
-        <button type="button" className="inline-flex items-center gap-1 rounded-sm hover:text-ink" onClick={() => setSort({ key, dir: active && sort.dir === -1 ? 1 : -1 })}>
+      <th scope="col" aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"} className={`px-4 py-2 font-medium ${align}`}>
+        <button type="button" className="inline-flex items-center gap-1 rounded-sm hover:text-ink" onClick={() => { setSort({ key, direction: active && sort.direction === "desc" ? "asc" : "desc" }); setPage(1); }}>
           {label}
-          {active && (sort.dir === 1 ? <ArrowUp aria-hidden className="size-3" /> : <ArrowDown aria-hidden className="size-3" />)}
+          {active && (sort.direction === "asc" ? <ArrowUp aria-hidden className="size-3" /> : <ArrowDown aria-hidden className="size-3" />)}
         </button>
       </th>
     );
   };
 
   return (
-    <>
+    <div id="posts-list" className="scroll-mt-16 md:scroll-mt-4">
       <PageHeader
         title="Posts"
         description="Clips sent to your YouTube channel. View counts refresh every 30 minutes."
         actions={
-          <select aria-label="Filter posts by status" className="field w-40" value={filter} onChange={(e) => { setFilter(e.target.value as Filter); setPage(0); }}>
+          <select aria-label="Filter posts by status" className="field w-40" value={filter} onChange={(e) => { setFilter(e.target.value as Filter); setPage(1); }}>
             <option value="all">All statuses</option>
             <option value="published">Published</option>
             <option value="scheduled">Scheduled</option>
@@ -62,7 +54,7 @@ export default function PostsPage() {
         <ErrorState message={posts.error} onRetry={posts.reload} />
       ) : posts.loading && !posts.data ? (
         <SkeletonRows rows={5} />
-      ) : (posts.data ?? []).length === 0 ? (
+      ) : !posts.data?.unfiltered_total ? (
         <EmptyState
           icon={<Send />}
           title="Nothing posted yet"
@@ -73,11 +65,10 @@ export default function PostsPage() {
             </Link>
           }
         />
-      ) : rows.length === 0 ? (
+      ) : posts.data.items.length === 0 ? (
         <EmptyState title="No posts with this status" body="Pick another status to see the rest." action={<Button onClick={() => setFilter("all")}>Show all posts</Button>} />
       ) : (
-        <>
-          <div className="panel overflow-x-auto">
+          <div className="panel relative overflow-x-auto">
             <table className="w-full min-w-[720px] text-sm">
               <thead className="border-b border-line-subtle text-xs text-ink-3">
                 <tr>
@@ -87,11 +78,11 @@ export default function PostsPage() {
                   <th scope="col" className="px-4 py-2 text-left font-medium">Goes public</th>
                   {header("views", "Views", "text-right")}
                   {header("created_at", "Sent", "text-right")}
-                  <th scope="col" className="px-4 py-2"><span className="sr-only">Links</span></th>
+                  <th scope="col" aria-label="Links" className="px-4 py-2" />
                 </tr>
               </thead>
               <tbody className="divide-y divide-line-subtle">
-                {visible.map((post) => (
+                {posts.data.items.map((post) => (
                   <tr key={post.id} className="hover:bg-raised">
                     <td className="max-w-[320px] px-4 py-2.5">
                       <Link href={`/clip/?id=${post.clip_id}`} className="block truncate font-medium hover:underline">
@@ -121,17 +112,8 @@ export default function PostsPage() {
               </tbody>
             </table>
           </div>
-          {pages > 1 && (
-            <nav aria-label="Pagination" className="mt-4 flex items-center justify-between">
-              <span className="num text-xs text-ink-3">Page {current + 1} of {pages}</span>
-              <div className="flex gap-2">
-                <Button disabled={current === 0} onClick={() => setPage(current - 1)}>Previous</Button>
-                <Button disabled={current >= pages - 1} onClick={() => setPage(current + 1)}>Next</Button>
-              </div>
-            </nav>
-          )}
-        </>
       )}
-    </>
+      <Pagination data={posts.data ?? (posts.loading ? posts.previousData : null)} label="Posts" onPageChange={setPage} loading={posts.loading} className="mt-4" anchorId="posts-list" />
+    </div>
   );
 }

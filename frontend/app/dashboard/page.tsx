@@ -2,19 +2,23 @@
 
 import { ChevronDown, Film, Link2, Upload } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
 import { JobRow } from "@/components/job-row";
+import { Pagination } from "@/components/pagination";
 import { Button, EmptyState, ErrorState, Field, Notice, SkeletonRows, cx, useToast } from "@/components/ui";
-import { api, clipScore, useApi, type Clip, type Job, type Settings, type SecretStatus, type SystemStatus } from "@/lib/api";
+import { api, useApi, type ClipSummary, type Job, type Page, type Settings, type SecretStatus, type SystemStatus } from "@/lib/api";
+import { usePagedApi } from "@/lib/pagination";
 
 type Overrides = { max_clips: number; min_sec: number; max_sec: number; aspect: Settings["format"]["aspect"]; quality: number };
 
 export default function HomePage() {
   const toast = useToast();
-  const jobs = useApi<Job[]>("/api/jobs", 2000);
-  const clips = useApi<Clip[]>("/api/clips", 5000);
+  const [jobPage, setJobPage] = useState(1);
+  const [clipPage, setClipPage] = useState(1);
+  const jobs = usePagedApi<Page<Job>>("/api/jobs", jobPage, 8, {}, 2000);
+  const clips = usePagedApi<Page<ClipSummary>>("/api/clips", clipPage, 6, { ready: "true", sort: "score" }, 5000);
   const settings = useApi<{ settings: Settings; secrets: SecretStatus }>("/api/settings");
   const system = useApi<SystemStatus>("/api/system", 10000);
   const input = useRef<HTMLInputElement>(null);
@@ -72,7 +76,8 @@ export default function HomePage() {
       }
       await api(`/api/uploads/${started.id}/complete`, { method: "POST", json: { options: jobOptions() } });
       toast("Uploaded. It keeps working if you close this page.");
-      void jobs.reload();
+      if (jobPage === 1) void jobs.reload();
+      else setJobPage(1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "The upload did not finish. Try again.");
     } finally {
@@ -95,7 +100,8 @@ export default function HomePage() {
       await api("/api/jobs", { method: "POST", json: { url: link, options: jobOptions() } });
       setUrl("");
       toast("Added. It keeps working if you close this page.");
-      void jobs.reload();
+      if (jobPage === 1) void jobs.reload();
+      else setJobPage(1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not add the link.");
     } finally {
@@ -103,15 +109,8 @@ export default function HomePage() {
     }
   }
 
-  const visibleJobs = useMemo(() => (jobs.data ?? []).slice(0, 8), [jobs.data]);
-  const topClips = useMemo(
-    () =>
-      (clips.data ?? [])
-        .filter((c) => c.status === "ready")
-        .sort((a, b) => (clipScore(b) ?? -1) - (clipScore(a) ?? -1))
-        .slice(0, 6),
-    [clips.data],
-  );
+  const visibleJobs = jobs.data?.items ?? [];
+  const topClips = clips.data?.items ?? [];
   const set = <K extends keyof Overrides>(key: K, value: Overrides[K]) => setOverrides((o) => (o ? { ...o, [key]: value } : o));
 
   return (
@@ -247,7 +246,7 @@ export default function HomePage() {
         </form>
       </section>
 
-      <section aria-labelledby="jobs-heading">
+      <section aria-labelledby="jobs-heading" className="scroll-mt-16 md:scroll-mt-4" id="videos-list">
         <div className="mb-3 flex items-center justify-between">
           <h2 id="jobs-heading" className="text-sm font-medium">
             Videos
@@ -260,24 +259,27 @@ export default function HomePage() {
         ) : visibleJobs.length === 0 ? (
           <EmptyState icon={<Link2 />} title="No videos yet" body="Paste a YouTube link above. Clips appear here as they finish, and work continues in the background if you close this page." />
         ) : (
-          <ul className="panel divide-y divide-line-subtle">
-            {visibleJobs.map((job) => (
-              <JobRow key={job.id} job={job} onChange={() => void jobs.reload()} />
-            ))}
-          </ul>
+          <div className="panel">
+            <ul className="divide-y divide-line-subtle">
+              {visibleJobs.map((job) => (
+                <JobRow key={job.id} job={job} onChange={() => void jobs.reload()} />
+              ))}
+            </ul>
+          </div>
         )}
+        <Pagination data={jobs.data ?? (jobs.loading ? jobs.previousData : null)} label="Videos" onPageChange={setJobPage} loading={jobs.loading} className="mt-3" anchorId="videos-list" />
       </section>
 
-      <section aria-labelledby="top-heading">
+      <section aria-labelledby="top-heading" className="scroll-mt-16 md:scroll-mt-4" id="ranked-clips">
         <div className="mb-3 flex items-center justify-between">
           <h2 id="top-heading" className="text-sm font-medium">
             Highest-scoring clips
           </h2>
-          {topClips.length > 0 && (
+          {(clips.data ?? clips.previousData)?.total ? (
             <Link href="/clips/" className="text-xs text-ink-2 underline-offset-2 hover:text-ink hover:underline">
               All clips
             </Link>
-          )}
+          ) : null}
         </div>
         {clips.error ? (
           <ErrorState message={clips.error} onRetry={clips.reload} />
@@ -292,6 +294,7 @@ export default function HomePage() {
             ))}
           </div>
         )}
+        <Pagination data={clips.data ?? (clips.loading ? clips.previousData : null)} label="Highest-scoring clips" onPageChange={setClipPage} loading={clips.loading} className="mt-3" anchorId="ranked-clips" />
       </section>
     </div>
   );
