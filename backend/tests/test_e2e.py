@@ -847,6 +847,90 @@ def test_anyone_can_sign_in_and_nobody_is_an_administrator(monkeypatch):
     _wipe_people()
 
 
+def test_dashboard_lists_page_filter_and_sort_before_limiting(monkeypatch):
+    monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
+    owner = _person("page-owner@example.com", "page-owner")
+    stranger = _person("page-stranger@example.com", "page-stranger")
+    browser = _browser(owner)
+    user_id = owner["id"]
+    try:
+        for number in range(12):
+            db.insert("jobs", {"id": f"page-video-{number:02}", "user_id": user_id, "kind": "video",
+                               "title": f"Video {number:02}", "status": "done", "created_at": number})
+        db.insert("jobs", {"id": "page-live", "user_id": user_id, "kind": "live", "status": "done", "created_at": 0})
+        db.insert("jobs", {"id": "page-more", "user_id": user_id, "kind": "more", "status": "running",
+                           "payload": {"source_job_id": "page-video-00"}, "created_at": 25})
+        db.insert("jobs", {"id": "page-foreign-job", "user_id": stranger["id"], "kind": "video", "created_at": 30})
+        for number in range(13):
+            db.insert("clips", {"id": f"page-clip-{number:02}", "job_id": "page-video-00", "user_id": user_id,
+                                "status": "ready" if number else "rendering", "created_at": number, "start": 1,
+                                "end": 60 - number, "title": "Final [demo]" if number == 1 else "Example",
+                                "source_channel": "Studio", "ai_score": 99 - number, "panel_score": 0 if number == 2 else None,
+                                "thumb": "s3:internal/clip.jpg"})
+        db.insert("clips", {"id": "page-foreign-clip", "job_id": "page-foreign-job", "user_id": stranger["id"],
+                            "status": "ready", "panel_score": 100, "created_at": 100})
+        for number in range(5):
+            db.insert("posts", {"id": f"page-post-{number}", "clip_id": "page-clip-01", "user_id": user_id,
+                                "title": ["Zulu", "copper", "Bravo", "alpha", "zydeco"][number], "created_at": number,
+                                "views": number if number else None, "status": "published" if number < 4 else "failed"})
+        db.insert("posts", {"id": "page-foreign-post", "clip_id": "page-foreign-clip", "user_id": stranger["id"],
+                            "title": "Foreign", "views": 100, "status": "published", "created_at": 100})
+
+        first = browser.get("/api/jobs?page=1&page_size=8").json()
+        last = browser.get("/api/jobs?page=99&page_size=8").json()
+        assert (first["total"], len(first["items"]), last["page"], len(last["items"])) == (13, 8, 2, 5)
+        assert not {j["id"] for j in first["items"]} & {j["id"] for j in last["items"]}
+        source = next(j for j in last["items"] if j["id"] == "page-video-00")
+        assert source["clip_count"] == 12 and source["more"]["id"] == "page-more"
+        live = browser.get("/api/jobs?kind=live&page=1&page_size=1").json()
+        assert live["total"] == 1 and live["items"][0]["id"] == "page-live"
+        picker = browser.get("/api/jobs?page=1&summary=true&q=video%2000").json()
+        assert picker["items"] == [{"id": "page-video-00", "title": "Video 00", "url": None}]
+
+        ranked = browser.get("/api/clips?page=1&page_size=2&sort=score&ready=true").json()
+        assert ranked["total"] == 12 and [c["id"] for c in ranked["items"]] == ["page-clip-01", "page-clip-03"]
+        assert ranked["items"][0]["thumb_url"].startswith("/api/clips/page-clip-01/thumb")
+        assert "thumb" not in ranked["items"][0] and "panel" not in ranked["items"][0]
+        clips = browser.get("/api/clips", params={"page": 2, "page_size": 2, "job_id": "page-video-00",
+                                                "sort": "shortest", "min_score": 45}).json()
+        assert (clips["total"], clips["unfiltered_total"], clips["source_title"]) == (12, 13, "Video 00")
+        assert [c["id"] for c in clips["items"]] == ["page-clip-10", "page-clip-09"]
+        found = browser.get("/api/clips", params={"page": 1, "q": "FINAL [demo] studio"}).json()
+        assert found["total"] == 1 and found["items"][0]["id"] == "page-clip-01"
+        assert browser.get("/api/clips?page=1&job_id=page-foreign-job").json()["source_title"] is None
+
+        posts = browser.get("/api/posts?page=2&page_size=2&status=published&sort=views").json()
+        assert (posts["total"], posts["unfiltered_total"]) == (4, 5)
+        assert [p["id"] for p in posts["items"]] == ["page-post-1", "page-post-0"]
+        history = browser.get("/api/posts?page=1&page_size=2&clip_id=page-clip-01&sort=title&direction=asc").json()
+        assert [p["title"] for p in history["items"]] == ["alpha", "Bravo"]
+        assert "posts" not in browser.get("/api/clips/page-clip-01?include_posts=false").json()
+        assert browser.get("/api/posts?page=1&clip_id=page-foreign-clip").json()["total"] == 0
+        assert browser.get("/api/jobs?page=0").status_code == 422
+        assert browser.get("/api/clips?page=1&page_size=51").status_code == 422
+    finally:
+        for collection in ("jobs", "clips", "posts"):
+            db.delete(collection, {"user_id": {"$in": [user_id, stranger["id"]]}})
+        _wipe_people()
+
+
+def test_trends_pages_keep_stats_for_all_results(client):
+    previous = db.kv_get("trends")
+    videos = [{"id": str(n), "duration": n * 10, "views": 1000 - n} for n in range(1, 14)]
+    db.kv_set("trends", {"videos": videos, "fetched_at": 1, "profile": {"ideal_length_sec": 30}})
+    try:
+        data = client.get("/api/trends?page=2&page_size=10").json()["data"]
+        assert data["videos"] == {"items": videos[10:], "page": 2, "page_size": 10, "total": 13}
+        assert (data["most_views"], data["typical_length"]) == (999, 70)
+        assert data["profile"]["ideal_length_sec"] == 30
+        assert client.get("/api/trends").json()["data"]["videos"] == videos
+    finally:
+        if previous is None:
+            db.kv_delete("trends")
+        else:
+            db.kv_set("trends", previous)
+
+
 def test_people_see_only_their_own_work(monkeypatch):
     monkeypatch.setenv("CLIPPER_AUTH_DISABLED", "0")
     _wipe_people()

@@ -17,10 +17,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -199,6 +199,15 @@ def _job_out(job: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
+def _clip_media_url(clip: dict[str, Any], key: str) -> str | None:
+    return (f"/api/clips/{clip['id']}/{key}?v={int(clip.get('created_at') or 0)}"
+            if clip.get(key) else None)
+
+
+def _clip_duration(clip: dict[str, Any]) -> float:
+    return round((clip.get("end") or 0) - (clip.get("start") or 0), 2)
+
+
 def clip_out(clip: dict[str, Any]) -> dict[str, Any]:
     opts = clip.pop("options", None) or {}
     settings = opts.get("settings", {})
@@ -207,13 +216,50 @@ def clip_out(clip: dict[str, Any]) -> dict[str, Any]:
     # Files are served through the API, which sends the browser to a temporary
     # signed link when the file is held in remote storage.
     for key in ("file", "thumb"):
-        clip[f"{key}_url"] = (f"/api/clips/{clip['id']}/{key}?v={int(clip.get('created_at') or 0)}"
-                              if clip.get(key) else None)
+        clip[f"{key}_url"] = _clip_media_url(clip, key)
     clip.pop("file", None)  # internal storage references are never sent to the browser
     clip.pop("thumb", None)
     clip.pop("user_id", None)
-    clip["duration"] = round((clip.get("end") or 0) - (clip.get("start") or 0), 2)
+    clip["duration"] = _clip_duration(clip)
     return clip
+
+
+PageNumber = Annotated[int | None, Query(ge=1)]
+PageSize = Annotated[int, Query(ge=1, le=50)]
+ListSearch = Annotated[str, Query(max_length=200)]
+RECENT_FIRST = [("created_at", -1), ("_id", -1)]
+
+
+def _page_info(total: int, page: int, size: int) -> tuple[dict[str, int], int]:
+    page = min(page, max(1, (total + size - 1) // size))
+    return {"page": page, "page_size": size, "total": total}, (page - 1) * size
+
+
+def _find_page(collection: str, filt: dict[str, Any], page: int, size: int, *,
+               sort: list[tuple[str, int]] = RECENT_FIRST,
+               fields: list[str] | None = None, rank: dict[str, Any] | None = None) -> dict[str, Any]:
+    def read(offset: int) -> list[dict[str, Any]]:
+        if rank is None:
+            return db.find(collection, filt, sort=sort, limit=size, skip=offset, fields=fields)
+        pipeline = [{"$match": filt}]
+        if fields:
+            pipeline.append({"$project": {**dict.fromkeys(fields, 1), "rank": rank}})
+        else:
+            pipeline.append({"$addFields": {"rank": rank}})
+        pipeline.extend([{"$sort": dict(sort)}, {"$skip": offset}, {"$limit": size}])
+        items = list(db.coll(collection).aggregate(pipeline))
+        for item in items:
+            item.pop("_id", None)
+            item.pop("rank", None)
+        return items
+
+    info, offset = _page_info(db.count(collection, filt), page, size)
+    items = read(offset)
+    # A deletion between the count and the read can invalidate the last page.
+    if offset and not items:
+        info, offset = _page_info(db.count(collection, filt), page, size)
+        items = read(offset)
+    return {**info, "items": items}
 
 
 # ---- accounts --------------------------------------------------------------
@@ -332,17 +378,29 @@ def ai_test(request: Request) -> dict[str, Any]:
 
 # ---- jobs ------------------------------------------------------------------
 @app.get("/api/jobs")
-def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
-    rows = db.find("jobs", {**_mine(request), "kind": {"$in": ["auto", "video", "live"]}},
-                   sort=[("created_at", -1)], limit=200)
-    ready: dict[str, int] = {}
-    for clip in db.find("clips", {**_mine(request), "status": "ready"}, fields=["job_id"]):
-        ready[clip["job_id"]] = ready.get(clip["job_id"], 0) + 1
-    newest_more: dict[str, dict[str, Any]] = {}
-    for item in db.find("jobs", {**_mine(request), "kind": "more"}, sort=[("created_at", 1)]):
-        source = (item["payload"] or {}).get("source_job_id")
-        if source:
-            newest_more[source] = item  # later rows replace earlier ones
+def list_jobs(request: Request, kind: str | None = None, page: PageNumber = None,
+              page_size: PageSize = 8, q: ListSearch = "", summary: bool = False) -> Any:
+    kinds = ["auto", "video", "live"]
+    filt = {**_mine(request), "kind": {"$in": [k for k in kinds if not kind or k == kind]}}
+    if q.strip():
+        pattern = {"$regex": re.escape(q.strip()), "$options": "i"}
+        filt["$or"] = [{field: pattern} for field in ("title", "channel", "url")]
+    fields = ["id", "title", "url"] if summary else None
+    result = _find_page("jobs", filt, page, page_size, fields=fields) if page is not None else None
+    rows = result["items"] if result is not None else db.find("jobs", filt, sort=RECENT_FIRST, limit=200, fields=fields)
+    if summary or not rows:
+        return result if result is not None else rows
+
+    ids = {"$in": [row["id"] for row in rows]}
+    ready = {c["_id"]: c["count"] for c in db.coll("clips").aggregate([
+        {"$match": {**_mine(request), "job_id": ids, "status": "ready"}},
+        {"$group": {"_id": "$job_id", "count": {"$sum": 1}}},
+    ])}
+    newest_more = {c["_id"]: c["job"] for c in db.coll("jobs").aggregate([
+        {"$match": {**_mine(request), "kind": "more", "payload.source_job_id": ids}},
+        {"$sort": dict(RECENT_FIRST)},
+        {"$group": {"_id": "$payload.source_job_id", "job": {"$first": "$$ROOT"}}},
+    ])}
     for row in rows:
         row["clip_count"] = ready.get(row["id"], 0)
         item = newest_more.get(row["id"])
@@ -350,7 +408,7 @@ def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]
             row["more"] = {"id": item["id"], "status": item["status"], "step": item["step"],
                            "progress": item["progress"], "error": item["error"]}
         _job_out(row)
-    return [r for r in rows if not kind or r["kind"] == kind]
+    return result if result is not None else rows
 
 
 @app.post("/api/jobs", status_code=201)
@@ -567,17 +625,58 @@ def delete_job(job_id: str, request: Request) -> None:
 
 
 # ---- clips -----------------------------------------------------------------
+CLIP_CARD_FIELDS = ["id", "job_id", "status", "title", "start", "end", "ai_score", "panel_score",
+                    "thumb", "source_channel", "created_at"]
+CLIP_SCORE = {"$ifNull": ["$panel_score", {"$ifNull": ["$ai_score", -1]}]}
+CLIP_DURATION = {"$subtract": [{"$ifNull": ["$end", 0]}, {"$ifNull": ["$start", 0]}]}
+
+
 @app.get("/api/clips")
-def list_clips(request: Request, job_id: str | None = None) -> list[dict[str, Any]]:
+def list_clips(request: Request, job_id: str | None = None, page: PageNumber = None, page_size: PageSize = 12,
+               q: ListSearch = "", min_score: Annotated[int, Query(ge=0, le=100)] = 0,
+               sort: Literal["score", "newest", "shortest", "longest"] = "newest", ready: bool = False) -> Any:
     filt = {**_mine(request), **({"job_id": job_id} if job_id else {})}
-    return [clip_out(c) for c in db.find("clips", filt, sort=[("created_at", -1)], limit=500)]
+    if ready:
+        filt["status"] = "ready"
+    if page is None:
+        return [clip_out(c) for c in db.find("clips", filt, sort=RECENT_FIRST, limit=500)]
+
+    base = filt.copy()
+    q = q.strip()
+    conditions = []
+    if q:
+        conditions.append({"$regexMatch": {
+            "input": {"$concat": [{"$ifNull": ["$title", ""]}, " ",
+                                  {"$ifNull": ["$source_channel", ""]}, " ",
+                                  {"$ifNull": ["$source_title", ""]}]},
+            "regex": re.escape(q), "options": "i",
+        }})
+    if min_score:
+        conditions.append({"$gte": [CLIP_SCORE, min_score]})
+    if conditions:
+        filt["$expr"] = {"$and": conditions}
+
+    ranks = {"score": CLIP_SCORE, "shortest": CLIP_DURATION, "longest": CLIP_DURATION}
+    order = RECENT_FIRST if sort == "newest" else [("rank", 1 if sort == "shortest" else -1), *RECENT_FIRST]
+    result = _find_page("clips", filt, page, page_size, fields=CLIP_CARD_FIELDS, sort=order, rank=ranks.get(sort))
+    for clip in result["items"]:
+        clip["thumb_url"] = _clip_media_url(clip, "thumb")
+        clip["duration"] = _clip_duration(clip)
+        for field in ("thumb", "start", "end"):
+            clip.pop(field, None)
+    result["unfiltered_total"] = db.count("clips", base) if conditions else result["total"]
+    if job_id:
+        source = db.find_one("jobs", {"id": job_id, **_mine(request)})
+        result["source_title"] = (source or {}).get("title")
+    return result
 
 
 @app.get("/api/clips/{clip_id}")
-def get_clip(clip_id: str, request: Request) -> dict[str, Any]:
+def get_clip(clip_id: str, request: Request, include_posts: bool = True) -> dict[str, Any]:
     out = clip_out(_clip_for(request, clip_id))
-    out["posts"] = [_post_out(p) for p in db.find("posts", {"clip_id": clip_id, **_mine(request)},
-                                                  sort=[("created_at", -1)])]
+    if include_posts:
+        out["posts"] = [_post_out(p) for p in db.find("posts", {"clip_id": clip_id, **_mine(request)},
+                                                      sort=RECENT_FIRST)]
     return out
 
 
@@ -731,10 +830,18 @@ def put_secret(body: SecretUpdate, request: Request) -> dict[str, Any]:
 
 # ---- trends ----------------------------------------------------------------
 @app.get("/api/trends")
-def get_trends() -> dict[str, Any]:
+def get_trends(page: PageNumber = None, page_size: PageSize = 10) -> dict[str, Any]:
     running = db.count("jobs", {"kind": "trends", "status": {"$in": ["queued", "running"]}})
     failed = db.find("jobs", {"kind": "trends"}, sort=[("created_at", -1)], limit=1)
-    return {"data": trends.current(), "refreshing": running > 0,
+    data = trends.current()
+    if data is not None and page is not None:
+        videos = data.get("videos") or []
+        info, offset = _page_info(len(videos), page, page_size)
+        lengths = sorted(v["duration"] for v in videos if v.get("duration"))
+        data = {**data, "videos": {**info, "items": videos[offset:offset + page_size]},
+                "most_views": videos[0].get("views") if videos else None,
+                "typical_length": lengths[len(lengths) // 2] if lengths else None}
+    return {"data": data, "refreshing": running > 0,
             "error": (failed[0] if failed else {}).get("error")}
 
 
@@ -788,13 +895,26 @@ def _post_out(post: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/posts")
-def list_posts(request: Request) -> list[dict[str, Any]]:
-    posts = db.find("posts", _mine(request), sort=[("created_at", -1)], limit=300)
-    clips = {c["id"]: c for c in db.find("clips", {"id": {"$in": [p["clip_id"] for p in posts]}},
-                                         fields=["id", "thumb", "panel_score"])}
+def list_posts(request: Request, page: PageNumber = None, page_size: PageSize = 20, clip_id: str | None = None,
+               status: Literal["uploading", "scheduled", "published", "failed"] | None = None,
+               sort: Literal["created_at", "views", "title"] = "created_at", direction: Literal["asc", "desc"] = "desc") -> Any:
+    base = {**_mine(request), **({"clip_id": clip_id} if clip_id else {})}
+    filt = {**base, **({"status": status} if status else {})}
+    if page is not None:
+        ranks = {"views": {"$ifNull": ["$views", -1]}, "title": {"$toLower": {"$ifNull": ["$title", ""]}}}
+        dir_num = 1 if direction == "asc" else -1
+        order = [("created_at", dir_num), ("_id", -1)] if sort == "created_at" else [("rank", dir_num), *RECENT_FIRST]
+        result = _find_page("posts", filt, page, page_size, sort=order, rank=ranks.get(sort))
+        result["items"] = [_post_out(post) for post in result["items"]]
+        result["unfiltered_total"] = db.count("posts", base) if status else result["total"]
+        return result
+
+    posts = db.find("posts", filt, sort=RECENT_FIRST, limit=300)
+    clips = {c["id"]: c for c in db.find("clips", {**_mine(request), "id": {"$in": [p["clip_id"] for p in posts]}},
+                                         fields=["id", "thumb", "panel_score", "created_at"])}
     for post in posts:
         clip = clips.get(post["clip_id"], {})
-        post["thumb"], post["panel_score"] = clip.get("thumb"), clip.get("panel_score")
+        post["thumb"], post["panel_score"] = _clip_media_url(clip, "thumb"), clip.get("panel_score")
         _post_out(post)
     return posts
 

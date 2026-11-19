@@ -75,6 +75,15 @@ export interface Clip {
   posts?: Post[];
 }
 
+export type ClipSummary = Pick<Clip, "id" | "status" | "title" | "duration" | "panel_score" | "ai_score" | "thumb_url" | "source_channel">;
+
+export interface Page<T> {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+}
+
 export interface Post {
   id: string;
   clip_id: string;
@@ -180,7 +189,9 @@ export interface TrendVideo {
 export interface Trends {
   data: {
     fetched_at: number;
-    videos: TrendVideo[];
+    videos: Page<TrendVideo>;
+    most_views: number | null;
+    typical_length: number | null;
     warning: string | null;
     profile: {
       summary?: string;
@@ -235,39 +246,51 @@ export const mediaUrl = (path: string | null | undefined) => (path ? `${API_URL}
 
 /** Fetches `path` and refetches every `interval` ms while the tab is visible. */
 export function useApi<T>(path: string | null, interval = 0) {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(path !== null);
-  const current = useRef(path);
+  const [result, setResult] = useState<{ path: string; data: T | null; error: string | null } | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const activePath = useRef<string | null>(null);
 
   const load = useCallback(async () => {
-    if (path === null) return;
+    if (path === null || path !== activePath.current) return;
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
     try {
-      const result = await api<T>(path);
-      if (current.current !== path) return;
-      setData(result);
-      setError(null);
+      const data = await api<T>(path, { signal: controller.signal });
+      if (!controller.signal.aborted) setResult({ path, data, error: null });
     } catch (err) {
-      if (current.current !== path) return;
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      if (!controller.signal.aborted) {
+        const error = err instanceof Error ? err.message : "Something went wrong.";
+        setResult((previous) => ({ path, data: previous?.path === path ? previous.data : null, error }));
+      }
     } finally {
-      if (current.current === path) setLoading(false);
+      if (request.current === controller) request.current = null;
     }
   }, [path]);
 
   useEffect(() => {
-    current.current = path;
+    activePath.current = path;
     if (path === null) return;
-    setLoading(true);
     void load();
-    if (!interval) return;
-    const timer = setInterval(() => {
-      if (document.visibilityState === "visible") void load();
-    }, interval);
-    return () => clearInterval(timer);
+    const timer = interval ? setInterval(() => {
+      if (!request.current && document.visibilityState === "visible") void load();
+    }, interval) : undefined;
+    return () => {
+      activePath.current = null;
+      request.current?.abort();
+      clearInterval(timer);
+    };
   }, [path, interval, load]);
 
-  return { data, error, loading, reload: load, setData };
+  const current = result?.path === path ? result : null;
+  const setData = (data: T) => {
+    if (path !== null && activePath.current === path) {
+      request.current?.abort();
+      setResult({ path, data, error: null });
+    }
+  };
+  return { data: current?.data ?? null, previousData: result?.data ?? null, error: current?.error ?? null,
+    loading: path !== null && !current, reload: load, setData };
 }
 
 export function formatDuration(seconds: number | null | undefined): string {

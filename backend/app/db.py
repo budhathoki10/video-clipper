@@ -68,11 +68,15 @@ def coll(name: str) -> Any:
 def init() -> None:
     """Create the indexes the app relies on. Safe to run on every start."""
     d = database()
-    d.jobs.create_index([("user_id", 1), ("created_at", -1)])
+    d.jobs.create_index([("user_id", 1), ("created_at", -1), ("_id", -1)])
+    d.jobs.create_index([("user_id", 1), ("kind", 1), ("created_at", -1), ("_id", -1)])
+    d.jobs.create_index([("user_id", 1), ("kind", 1), ("payload.source_job_id", 1), ("created_at", -1)])
     d.jobs.create_index([("status", 1), ("created_at", 1)])
     d.clips.create_index([("job_id", 1)])
-    d.clips.create_index([("user_id", 1), ("created_at", -1)])
-    d.posts.create_index([("user_id", 1), ("created_at", -1)])
+    d.clips.create_index([("user_id", 1), ("created_at", -1), ("_id", -1)])
+    d.clips.create_index([("user_id", 1), ("job_id", 1), ("created_at", -1), ("_id", -1)])
+    d.posts.create_index([("user_id", 1), ("created_at", -1), ("_id", -1)])
+    d.posts.create_index([("user_id", 1), ("clip_id", 1), ("created_at", -1), ("_id", -1)])
     d.users.create_index([("email", 1)], unique=True)
     d.users.create_index([("google_sub", 1)], unique=True, sparse=True)
     d.sessions.create_index([("token_hash", 1)], unique=True)
@@ -91,10 +95,12 @@ def _clean(doc: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def find(name: str, filt: dict[str, Any] | None = None, *, sort: list[tuple[str, int]] | None = None,
-         limit: int = 0, fields: list[str] | None = None) -> list[dict[str, Any]]:
+         limit: int = 0, skip: int = 0, fields: list[str] | None = None) -> list[dict[str, Any]]:
     cursor = coll(name).find(filt or {}, {f: 1 for f in fields} if fields else None)
     if sort:
         cursor = cursor.sort(sort)
+    if skip:
+        cursor = cursor.skip(skip)
     if limit:
         cursor = cursor.limit(limit)
     return [_clean(doc) for doc in cursor]
