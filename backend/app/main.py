@@ -381,7 +381,8 @@ def ai_test(request: Request) -> dict[str, Any]:
 def list_jobs(request: Request, kind: str | None = None, page: PageNumber = None,
               page_size: PageSize = 8, q: ListSearch = "", summary: bool = False) -> Any:
     kinds = ["auto", "video", "live"]
-    filt = {**_mine(request), "kind": {"$in": [k for k in kinds if not kind or k == kind]}}
+    filt = {**_mine(request), "kind": {"$in": [k for k in kinds if not kind or k == kind]},
+            "hidden": {"$ne": True}}  # a video removed from the list keeps its clips, not its row here
     if q.strip():
         pattern = {"$regex": re.escape(q.strip()), "$options": "i"}
         filt["$or"] = [{field: pattern} for field in ("title", "channel", "url")]
@@ -613,15 +614,22 @@ def retry_job(job_id: str, request: Request) -> dict[str, str]:
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
 def delete_job(job_id: str, request: Request) -> None:
+    """Remove a video from the list. Its clips are never touched: they stay in Clips and in storage, and
+    keep working (re-render, audience score). Only the video's own entry and its large downloaded copy
+    go. A video that made no clips is deleted outright. Clips are deleted one by one, from their page."""
     job = _job_for(request, job_id)
     if job["status"] in ("running", "stopping"):
         raise fail(409, "Stop the job before deleting it.")
-    for stored in db.find("clips", {"job_id": job_id}, fields=["file", "thumb"]):
-        storage.delete(stored.get("file"))
-        storage.delete(stored.get("thumb"))
-    db.delete("clips", {"job_id": job_id})
-    db.delete("jobs", {"id": job_id})
-    runner.delete_job_files(job_id, job.get("files"))
+    if not db.count("clips", {"job_id": job_id}):
+        db.delete("jobs", {"id": job_id})
+        runner.delete_job_files(job_id, job.get("files"))
+        return
+    # The clips still need the small working files (transcript, details), so the row stays, hidden.
+    files = dict(job.get("files") or {})
+    storage.delete(files.pop("source", None))  # the whole downloaded video is the big file
+    files.pop("source_name", None)
+    shutil.rmtree(config.JOBS_DIR / job_id, ignore_errors=True)
+    db.update("jobs", job_id, hidden=True, files={**files, "source": None, "source_name": None})
 
 
 # ---- clips -----------------------------------------------------------------

@@ -424,7 +424,7 @@ enforces this.
 | `GET /users` | Administrator-only account list, total users and active users |
 | `GET /jobs`, `POST /jobs`, `GET /jobs/{id}` | List, create (paste a link), read with its clips |
 | `POST /jobs/{id}/more` | Make more clips from a finished video (`count` 1-10, `label_part`); the request shows on the video's row as `more` |
-| `POST /jobs/{id}/stop`, `POST /jobs/{id}/retry`, `DELETE /jobs/{id}` | Cancel or stop a live watch; retry; delete job and its clips |
+| `POST /jobs/{id}/stop`, `POST /jobs/{id}/retry`, `DELETE /jobs/{id}` | Cancel or stop a live watch; retry; remove a video from the list (its clips, their files and the small working files are kept; only its big downloaded copy goes; a video with no clips is deleted outright) |
 | `GET /clips`, `GET /clips/{id}`, `PATCH /clips/{id}`, `DELETE /clips/{id}` | Clips; PATCH edits title/hook/description/trim/format and can re-render |
 | `POST /clips/{id}/hooks` | Five alternative on-screen hooks |
 | `GET /clips/{id}/file`, `/thumb`, `/download` | Playback, thumbnail, download (redirect to a signed link when stored remotely) |
