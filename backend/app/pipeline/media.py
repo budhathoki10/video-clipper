@@ -85,13 +85,44 @@ def _friendly(exc: Exception) -> str:
 
 
 COOKIE_CLIENTS = ["tv", "tv_downgraded", "web_embedded", "web_safari"]
+# The clients an open-source hosted clipper (OpenShorts) measured as giving 1080p with a PO token:
+# yt-dlp's own defaults plus the mobile web client, which needs the token from the helper below.
+TOKEN_CLIENTS = ["default", "mweb"]
 
 
-def network_options() -> dict[str, Any]:
-    """Settings for servers YouTube treats as bots. YTDLP_PROXY is a proxy address (a
-    residential proxy works best). YTDLP_COOKIES_FILE, or a Render secret file named cookies.txt, is
-    a Netscape-format cookies file; a copy is used because the original may be read-only. Nothing
-    changes when neither is set (the JavaScript runtimes below are always allowed)."""
+def token_helper() -> dict[str, Any]:
+    """Extractor args that let yt-dlp make YouTube's proof-of-origin token with the small Node program
+    baked into the server image (BGUTIL_SCRIPT_PATH). Empty when the program is not there."""
+    script = os.environ.get("BGUTIL_SCRIPT_PATH", "")
+    if script and Path(script).is_file():
+        return {"youtubepot-bgutilscript": {"script_path": [script]}}
+    return {}
+
+
+def _cookie_file() -> Path | None:
+    cookies = Path(config.secret("YTDLP_COOKIES_FILE") or "/etc/secrets/cookies.txt")
+    return cookies if cookies.is_file() else None
+
+
+def attempt_modes() -> list[str]:
+    """The ways to ask YouTube, best first; a blocked answer moves on to the next one.
+    token+cookies: a signed-in session and the token helper. token: the same without cookies, because
+    with cookies YouTube sometimes calls a video unplayable that works anonymously. cookies: the older
+    TV/embedded clients, which accept cookies without a token."""
+    has_cookies, has_token = _cookie_file() is not None, bool(token_helper())
+    if has_cookies and has_token:
+        return ["token+cookies", "token", "cookies"]
+    if has_token:
+        return ["token"]
+    return ["cookies", "plain"] if has_cookies else ["plain"]
+
+
+def network_options(mode: str | None = None) -> dict[str, Any]:
+    """Settings for servers YouTube treats as bots (see attempt_modes for `mode`). YTDLP_PROXY is a
+    proxy address (a residential proxy works best). YTDLP_COOKIES_FILE, or a Render secret file named
+    cookies.txt, is a Netscape-format cookies file; a copy is used because the original may be
+    read-only. Nothing changes when none is set (the JavaScript runtimes below are always allowed)."""
+    mode = mode or attempt_modes()[0]
     # YouTube hides its video formats behind a small JavaScript puzzle. yt-dlp solves it with Deno by
     # default; the server image has Node, so allow both. Without this the only formats found are
     # thumbnails and the download fails with "Requested format is not available".
@@ -99,19 +130,37 @@ def network_options() -> dict[str, Any]:
     proxy = config.secret("YTDLP_PROXY")
     if proxy:
         opts["proxy"] = proxy
-    cookies = Path(config.secret("YTDLP_COOKIES_FILE") or "/etc/secrets/cookies.txt")
-    if cookies.is_file():
+    cookies = _cookie_file()
+    if cookies and mode in ("token+cookies", "cookies"):
         copy = Path(tempfile.gettempdir()) / f"clipper-cookies-{os.getpid()}.txt"
         shutil.copyfile(cookies, copy)
         opts["cookiefile"] = str(copy)
+    if mode == "cookies":
         # With cookies yt-dlp may only use browser-type clients, and YouTube gives those no video files
-        # without a special token (only thumbnails). The TV and embedded clients accept cookies and
-        # need no token, so prefer them. YTDLP_CLIENTS (comma separated) overrides this.
+        # without a token (only thumbnails). The TV and embedded clients accept cookies and need none.
         opts["extractor_args"] = {"youtube": {"player_client": COOKIE_CLIENTS}}
+    elif mode in ("token+cookies", "token"):
+        # Never skip the web page here: the token request needs it.
+        opts["extractor_args"] = {**token_helper(), "youtube": {"player_client": TOKEN_CLIENTS}}
+    # YTDLP_CLIENTS (comma separated) overrides the client list of every mode.
     clients = [c.strip() for c in config.secret("YTDLP_CLIENTS").split(",") if c.strip()]
     if clients:
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts["extractor_args"] = {**opts.get("extractor_args", {}), "youtube": {"player_client": clients}}
     return opts
+
+
+def _attempts(action: Callable[[dict[str, Any]], Any]) -> Any:
+    """Run `action(network options)` in each mode until YouTube answers. Only an answer another mode
+    may change moves on (a block, or "no format"/"unavailable", which YouTube also gives a session it
+    distrusts); private, removed or no-network failures are the answer straight away."""
+    modes = attempt_modes()
+    for index, mode in enumerate(modes):
+        try:
+            return action(network_options(mode))
+        except MediaError as exc:
+            if index == len(modes) - 1 or not getattr(exc, "retry_other_mode", False):
+                raise
+            print(f"YouTube refused the '{mode}' way ({str(exc)[:80]}); trying '{modes[index + 1]}'.", flush=True)
 
 
 def describe_formats(info: dict[str, Any]) -> str:
@@ -123,12 +172,12 @@ def describe_formats(info: dict[str, Any]) -> str:
     return f"{len(formats)} formats offered" + (": " + " ".join(parts) if parts else "")
 
 
-def _log_offered_formats(url: str) -> None:
+def _log_offered_formats(url: str, net: dict[str, Any]) -> None:
     """When no usable format is found, say what YouTube did offer (usually only thumbnails when its
     JavaScript puzzle could not be solved), so the cause shows in the server log."""
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-                               "ignore_no_formats_error": True, **network_options()}) as ydl:
+                               "ignore_no_formats_error": True, **net}) as ydl:
             info = ydl.extract_info(url, download=False)
         print(f"yt-dlp: {describe_formats(info)}", flush=True)
     except Exception as exc:  # the diagnosis itself must never hide the real error
@@ -139,18 +188,25 @@ def _error(exc: Exception) -> MediaError:
     lowered = str(exc).lower()
     blocked = ("player response" in lowered or "http error 403" in lowered or "sign in to confirm" in lowered
                or ("age" in lowered and "confirm" in lowered) or ("bot" in lowered and "not a" in lowered))
-    return (Blocked if blocked else MediaError)(_friendly(exc))
+    error = (Blocked if blocked else MediaError)(_friendly(exc))
+    # "No format" and "unavailable" are what YouTube says to a session it distrusts, so another mode may
+    # still get the video; a private video never will.
+    error.retry_other_mode = blocked or "requested format is not available" in lowered or (
+        "unavailable" in lowered and "private" not in lowered)
+    return error
 
 
-def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
+def fetch_info(url: str, *, max_height: int = 1080, net: dict[str, Any] | None = None) -> dict[str, Any]:
+    if net is None:
+        return _attempts(lambda options: fetch_info(url, max_height=max_height, net=options))
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b", **network_options()}
+            "format": f"b[height<={max_height}]/bv*[height<={max_height}]+ba/b", **net}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except DownloadError as exc:
         if "requested format is not available" in str(exc).lower():
-            _log_offered_formats(url)
+            _log_offered_formats(url, net)
         raise _error(exc) from None
     thumbs = info.get("thumbnails") or []
     return {
@@ -174,7 +230,11 @@ def fetch_info(url: str, *, max_height: int = 1080) -> dict[str, Any]:
 
 def download(url: str, dest_dir: Path, *, max_height: int = 1080,
              max_minutes: float | None = None,
-             on_progress: Callable[[float], None] | None = None) -> Path:
+             on_progress: Callable[[float], None] | None = None,
+             net: dict[str, Any] | None = None) -> Path:
+    if net is None:
+        return _attempts(lambda options: download(url, dest_dir, max_height=max_height,
+                                                  max_minutes=max_minutes, on_progress=on_progress, net=options))
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     def hook(status: dict) -> None:
@@ -191,7 +251,7 @@ def download(url: str, dest_dir: Path, *, max_height: int = 1080,
         "outtmpl": str(dest_dir / "source.%(ext)s"),
         "progress_hooks": [hook],
         "retries": 5, "fragment_retries": 5, "concurrent_fragment_downloads": 4,
-        **network_options(),
+        **net,
     }
     if max_minutes:
         opts["download_ranges"] = download_range_func(None, [(0, max_minutes * 60)])

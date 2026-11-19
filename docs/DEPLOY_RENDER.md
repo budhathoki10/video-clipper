@@ -107,6 +107,28 @@ the server's worker then takes link jobs itself. Look for this line in Render's 
 - All of a downloaded video's data passes through Cloudflare WARP, which is meant for consumer use; check its
   terms if you expect heavy use.
 
+### How a link is asked for (the free route used by open-source hosted clippers)
+
+The server image also carries a small Node program that makes YouTube's "proof of origin" token (the
+`bgutil` helper, version-pinned in the `Dockerfile`). For each link the downloader tries, in order, and moves
+on only when YouTube refuses:
+
+1. a signed-in session (`cookies.txt`) with the `default` and `mweb` clients and the token,
+2. the same without cookies (with cookies YouTube sometimes calls a video unplayable that works anonymously),
+3. the older TV and embedded clients with the cookies.
+
+Without a `cookies.txt` only step 2 runs. The log says `YouTube refused the '…' way; trying '…'` for each step.
+`YTDLP_CLIENTS` (comma separated) replaces the client list of every step.
+
+**To add the signed-in session (optional, free):** use a **spare Google account, not your own**, because YouTube
+can limit an account that is used from a server. In a private browser window sign in to YouTube with it, export
+`youtube.com` cookies in Netscape format (a cookies.txt export extension), close the private window straight
+away so the browser does not refresh them, and upload the file to Render as a **secret file** named
+`cookies.txt`. Re-export it if downloads start failing again after days or weeks.
+
+No free route is guaranteed: YouTube can still refuse a hosting address. A residential proxy in `YTDLP_PROXY` is
+the dependable fix; the home-computer worker and file upload are the free fallbacks.
+
 ### Backup: let your own computer take the link jobs
 
 Your PC has a normal home address, and it can be a second worker for the same app. Uploaded files and all
@@ -123,7 +145,7 @@ other work stay on Render; only links go to your PC.
 4. While your PC is on and online, link jobs from every person are downloaded and clipped by it, and the
    finished clips go to the same storage and database. When it is off, link jobs wait; file uploads still work.
 
-Nobody else needs to do anything. You can remove the `cookies.txt` secret file; it is not needed.
+Nobody else needs to do anything. The `cookies.txt` secret file is optional (see above).
 
 ## 4. First sign-in
 
