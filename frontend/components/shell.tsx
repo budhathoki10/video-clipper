@@ -1,11 +1,12 @@
 "use client";
 
-import { Clapperboard, Film, House, LogOut, Radio, Send, Settings, TrendingUp } from "lucide-react";
+import { Film, House, LogOut, Radio, Send, Settings, TrendingUp } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 
 import { ApiError, api, useApi, type AuthSession, type SystemStatus } from "@/lib/api";
+import { Logo } from "./logo";
 import { Button, ErrorState, Spinner, cx, ToastProvider, useToast } from "./ui";
 
 const NAV = [
@@ -134,7 +135,7 @@ export function Shell({ children }: { children: ReactNode }) {
       <div className="flex min-h-dvh">
         <aside className="sticky top-0 hidden h-dvh w-56 flex-none flex-col border-r border-line bg-surface md:flex">
           <div className="flex h-14 items-center gap-2.5 border-b border-line-subtle px-4">
-            <span aria-hidden className="grid size-6 place-items-center rounded-md bg-accent text-accent-ink"><Clapperboard className="size-3.5" /></span>
+            <Logo className="size-7" />
             <span className="text-sm font-semibold tracking-tight text-ink">Clipper</span>
           </div>
           <nav aria-label="Main" className="flex flex-1 flex-col px-2 py-3">
@@ -166,6 +167,12 @@ export function Shell({ children }: { children: ReactNode }) {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
+          <header className="sticky top-0 z-30 border-b border-line bg-surface pt-[env(safe-area-inset-top)] md:hidden">
+            <div className="flex h-12 items-center gap-2.5 px-4">
+              <Logo className="size-7" />
+              <span className="text-sm font-semibold tracking-tight text-ink">Clipper</span>
+            </div>
+          </header>
           <main id="main" className="mx-auto w-full max-w-[1200px] flex-1 px-4 pt-6 pb-24 sm:px-6 md:pb-10 lg:px-8">
             {children}
           </main>
