@@ -176,6 +176,15 @@ function YouTubeConnect() {
   );
 }
 
+/** Settings saved before the automatic layout existed show (and are rendered) as automatic: the old
+ * default zoom of 1.35 cut a corner webcam off vertical clips. */
+function withCurrentLayout(settings: Settings): Settings {
+  if (settings.format.layout === "blur" && settings.format.zoom === 1.35) {
+    return { ...settings, format: { ...settings.format, layout: "auto", zoom: 1 } };
+  }
+  return settings;
+}
+
 export default function SettingsPage() {
   const toast = useToast();
   const remote = useApi<{ settings: Settings; secrets: SecretStatus }>("/api/settings");
@@ -190,7 +199,7 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (remote.data && !dirty) {
-      setForm(remote.data.settings);
+      setForm(withCurrentLayout(remote.data.settings));
       setSecrets(remote.data.secrets);
     }
   }, [remote.data, dirty]);
@@ -227,7 +236,7 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       const result = await api<{ settings: Settings; secrets: SecretStatus }>("/api/settings", { method: "PUT", json: form });
-      setForm(result.settings);
+      setForm(withCurrentLayout(result.settings));
       setDirty(false);
       toast("Settings saved. They apply to the next video.");
     } catch (err) {
@@ -328,13 +337,14 @@ export default function SettingsPage() {
                 <Field label="Layout" className="col-span-2">
                   {(p) => (
                     <select {...p} className="field" value={form.format.layout} onChange={(e) => set("format", "layout", e.target.value as Settings["format"]["layout"])}>
+                      <option value="auto">Automatic: creator&apos;s face on top when there is a webcam</option>
                       <option value="blur">Whole frame on a blurred background</option>
                       <option value="crop">Crop to fill the screen</option>
                     </select>
                   )}
                 </Field>
-                <Field label="Zoom on blurred layout" hint="1 shows the full width; higher crops the sides." className="col-span-2">
-                  {(p) => <input {...p} type="number" min={1} max={2} step={0.05} className="field num" disabled={form.format.layout !== "blur"} value={form.format.zoom} onChange={(e) => set("format", "zoom", num(e.target.value, 1.35))} />}
+                <Field label="Zoom on blurred layout" hint="1 shows the full width. Higher crops the sides and can cut off a webcam in a corner." className="col-span-2">
+                  {(p) => <input {...p} type="number" min={1} max={2} step={0.05} className="field num" disabled={form.format.layout !== "blur"} value={form.format.zoom} onChange={(e) => set("format", "zoom", num(e.target.value, 1))} />}
                 </Field>
               </div>
             )}
@@ -487,7 +497,7 @@ export default function SettingsPage() {
           <div className="mx-auto flex max-w-[1200px] flex-wrap items-center justify-between gap-3 sm:px-2 lg:px-4">
             <p role={error ? "alert" : undefined} className={`text-sm ${error ? "text-bad-ink" : "text-ink-2"}`}>{error || "You have unsaved changes."}</p>
             <div className="flex gap-2">
-              <Button variant="ghost" onClick={() => { setForm(remote.data!.settings); setDirty(false); setError(null); }}>Discard</Button>
+              <Button variant="ghost" onClick={() => { setForm(withCurrentLayout(remote.data!.settings)); setDirty(false); setError(null); }}>Discard</Button>
               <Button variant="primary" loading={saving} onClick={save}>Save changes</Button>
             </div>
           </div>

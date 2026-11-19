@@ -98,7 +98,7 @@ export interface Settings {
   clip: { min_sec: number; max_sec: number; max_clips: number; min_score: number; context_sec: number };
   format: {
     aspect: "9:16" | "16:9" | "1:1";
-    layout: "blur" | "crop";
+    layout: "auto" | "blur" | "crop";
     zoom: number;
     quality: number;
     fps: number;
