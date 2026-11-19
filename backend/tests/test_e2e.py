@@ -686,7 +686,7 @@ def test_more_clips_skip_used_moments_and_continue_the_numbering(tmp_path, monke
     clips = db.find("clips", {"job_id": "more3"}, sort=[("created_at", 1)])
     new = [c for c in clips if c["id"] != "more3-c1"]
     assert len(new) == 1, "the overlapping moment is skipped, only the new one is made"
-    assert new[0]["start"] >= 44 and new[0]["status"] == "ready"
+    assert new[0]["start"] >= 44 - 5 and new[0]["status"] == "ready", "the fresh moment, with 5 s of context before it"
     assert not (new[0]["start"] < 30 and new[0]["end"] > 10), "no overlap with the clip that already exists"
     assert new[0]["title"].endswith(" – Part 2"), new[0]["title"]
     assert (config.DATA / new[0]["file"]).exists() and source.exists()
@@ -1415,3 +1415,53 @@ def test_a_blocked_server_hands_the_link_to_a_home_computer_or_says_so(monkeypat
     assert db.find_one("jobs", {"id": "fresh"})["status"] == "queued"
     db.delete("jobs", {})
     db.delete("kv", {"_id": {"$regex": "^worker:"}})
+
+
+def test_clips_get_five_seconds_of_context_on_each_side():
+    settings = config.deep_merge(config.DEFAULT_SETTINGS, {})
+    assert settings["clip"]["context_sec"] == 5
+    pick = runner.add_context({"start": 100.0, "end": 120.0, "title": "x"}, duration=600, settings=settings)
+    assert (pick["start"], pick["end"]) == (95.0, 125.0), "a 20 s moment becomes a 30 s clip"
+    assert runner.add_context(pick, duration=600, settings=settings) == pick, "context is added once only"
+    edge = runner.add_context({"start": 2.0, "end": 22.0}, duration=25, settings=settings)
+    assert (edge["start"], edge["end"]) == (0.0, 25.0), "never before the start or past the end of the video"
+    short = runner.add_context({"start": 100.0, "end": 278.0}, duration=900, settings=settings)
+    assert short["end"] - short["start"] <= 180, "a vertical clip that fit in a Short stays a Short"
+    off = config.deep_merge(settings, {"clip": {"context_sec": 0}})
+    assert runner.add_context({"start": 100.0, "end": 120.0}, duration=600, settings=off)["start"] == 100.0
+
+
+def test_a_single_loud_noise_does_not_outrank_a_lasting_moment():
+    import numpy as np
+
+    from app.pipeline import signals
+
+    score = np.zeros(300, dtype=np.float32)
+    score[50] = 9.0  # one bang
+    score[200:225] = 3.0  # a long excited stretch
+    best = signals.candidates(score, spacing=30, limit=1)[0]
+    assert 195 <= best["peak"] <= 230, "the lasting stretch is chosen, not the single spike"
+    assert abs(signals.candidates(score, spacing=30, limit=1, sustain=1)[0]["peak"] - 50) < 1, "without it the spike wins"
+
+
+def test_a_live_clip_needs_excitement_several_segments_in_a_row(monkeypatch):
+    from app import live
+
+    session = live.LiveSession.__new__(live.LiveSession)
+    session.cfg = {**config.DEFAULT_SETTINGS["live"], "sustain_segments": 2}
+    session.history, session.pending, session.pending_peak, session.last_trigger = [], None, None, -1e9
+    monkeypatch.setattr(session, "_cleanup", lambda: None, raising=False)
+    monkeypatch.setattr(session, "_report", lambda: None, raising=False)
+
+    def feed(idx, score):
+        session._handle({"idx": idx, "path": Path("nope"), "t0": idx * 20.0, "dur": 20.0, "score": score})
+
+    for i in range(8):
+        feed(i, 0.5)
+    feed(8, 5.0)  # one spike
+    feed(9, 0.4)
+    assert session.pending is None, "a single loud segment does not start a clip"
+    feed(10, 3.0)
+    feed(11, 4.0)
+    assert session.pending and session.pending["idx"] == 11, "two segments in a row do"
+    assert session.pending_peak["score"] == 4.0, "the clip is centred on the strongest of them"

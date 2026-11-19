@@ -41,7 +41,8 @@ PROVIDER_SECRET = {
 }
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "clip": {"min_sec": 20, "max_sec": 60, "max_clips": 5, "min_score": 0},
+    "clip": {"min_sec": 20, "max_sec": 60, "max_clips": 5, "min_score": 0,
+             "context_sec": 5},  # added before and after each moment so viewers see what led up to it
     "format": {
         "aspect": "9:16",  # 9:16 | 16:9 | 1:1
         "layout": "blur",  # blur | crop
@@ -75,6 +76,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "live": {
         "sensitivity": 2.2,  # lower = more clips
+        "sustain_segments": 2,  # this many segments in a row must stand out; one loud noise is not a moment
         "segment_sec": 20,
         "lookback_sec": 60,
         "cooldown_sec": 90,

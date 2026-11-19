@@ -72,6 +72,7 @@ class LiveSession:
         self.watched = 0.0
         self.last_trigger = -1e9
         self.pending: dict[str, Any] | None = None
+        self.pending_peak: dict[str, Any] | None = None
         self.clips = 0
         self.windows = 0
         self.meta: dict[str, Any] = {}
@@ -133,7 +134,8 @@ class LiveSession:
             source.unlink(missing_ok=True)
             words_file.unlink(missing_ok=True)
             return
-        runner.make_clip(job_id=self.job_id, clip_id=db.new_id(), sel=picks[0], source=source,
+        pick = runner.add_context(picks[0], duration=total, settings=self.settings)
+        runner.make_clip(job_id=self.job_id, clip_id=db.new_id(), sel=pick, source=source,
                          words_file=words_file, meta=self.meta, settings=self.settings,
                          trend_brief=self.trend_brief)
         if storage.enabled() and storage.cfg().get("delete_source"):
@@ -147,17 +149,31 @@ class LiveSession:
             chosen = [h for h in self.history
                       if self.pending["idx"] - back <= h["idx"] <= self.pending["idx"] + 1
                       and h["path"].exists()]
-            peak, self.pending = self.pending, None
+            peak = self.pending_peak or self.pending
+            self.pending = self.pending_peak = None
             if chosen:
                 # Copy now: the segment files are deleted once they age out.
                 self.pool.submit(runner._in_context(self._safe_window), chosen, peak)
-        fresh = entry["t0"] - self.last_trigger >= float(self.cfg["cooldown_sec"])
-        if not self.pending and fresh and len(self.history) > WARMUP_SEGMENTS \
-                and entry["score"] >= float(self.cfg["sensitivity"]):
+        run = self.sustained_run()
+        if not self.pending and run and run[0]["t0"] - self.last_trigger >= float(self.cfg["cooldown_sec"]):
             self.pending = entry
+            self.pending_peak = max(run, key=lambda h: h["score"])
             self.last_trigger = entry["t0"]
         self._cleanup()
         self._report()
+
+    def sustained_run(self) -> list[dict[str, Any]]:
+        """The newest `sustain_segments` segments if every one stands out, else []. One loud noise or a
+        single shout is not a moment; excitement that holds for two or three segments in a row is."""
+        need = max(int(self.cfg.get("sustain_segments", 2) or 1), 1)
+        recent = self.history[-need:]
+        if len(self.history) <= WARMUP_SEGMENTS or len(recent) < need:
+            return []
+        if any(h["score"] < float(self.cfg["sensitivity"]) for h in recent):
+            return []
+        if any(b["idx"] != a["idx"] + 1 for a, b in zip(recent, recent[1:])):
+            return []  # a gap (a segment that could not be measured) breaks the run
+        return recent
 
     def _safe_window(self, entries: list[dict[str, Any]], peak: dict[str, Any]) -> None:
         try:
@@ -178,7 +194,8 @@ class LiveSession:
     def _payload(self) -> dict[str, Any]:
         return {"watched_sec": round(self.watched), "clips": self.clips,
                 "scores": [h["score"] for h in self.history[-60:]],
-                "threshold": float(self.cfg["sensitivity"])}
+                "threshold": float(self.cfg["sensitivity"]),
+                "sustain": max(int(self.cfg.get("sustain_segments", 2) or 1), 1)}
 
     def _report(self) -> None:
         watched = time.strftime("%H:%M:%S", time.gmtime(self.watched))

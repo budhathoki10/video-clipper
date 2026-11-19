@@ -298,6 +298,9 @@ export default function SettingsPage() {
                 <Field label="Shortest (seconds)">{(p) => <input {...p} type="number" min={5} max={180} className="field num" value={form.clip.min_sec} onChange={(e) => set("clip", "min_sec", num(e.target.value, 20))} />}</Field>
                 <Field label="Longest (seconds)">{(p) => <input {...p} type="number" min={5} max={180} className="field num" value={form.clip.max_sec} onChange={(e) => set("clip", "max_sec", num(e.target.value, 60))} />}</Field>
                 <Field label="Minimum AI score" hint="0 keeps every pick.">{(p) => <input {...p} type="number" min={0} max={100} className="field num" value={form.clip.min_score} onChange={(e) => set("clip", "min_score", num(e.target.value, 0))} />}</Field>
+                <Field label="Context before and after (seconds)" hint="Added to each side so viewers see what led up to the moment. A 20 s moment with 5 becomes a 30 s clip." className="col-span-2">
+                  {(p) => <input {...p} type="number" min={0} max={30} className="field num" value={form.clip.context_sec} onChange={(e) => set("clip", "context_sec", Math.min(num(e.target.value, 5), 30))} />}
+                </Field>
               </div>
             )}
 
@@ -421,6 +424,9 @@ export default function SettingsPage() {
             {tab === "live" && (
               <div className={GRID}>
                 <Field label="Clip threshold" hint="Lower makes more clips.">{(p) => <input {...p} type="number" min={0.5} max={6} step={0.1} className="field num" value={form.live.sensitivity} onChange={(e) => set("live", "sensitivity", num(e.target.value, 2.2))} />}</Field>
+                <Field label="Segments in a row" hint="How many recorded segments in a row must pass the threshold. 1 lets a single loud noise start a clip.">
+                  {(p) => <input {...p} type="number" min={1} max={5} className="field num" value={form.live.sustain_segments} onChange={(e) => set("live", "sustain_segments", Math.min(Math.max(num(e.target.value, 2), 1), 5))} />}
+                </Field>
                 <Field label="Look back (seconds)" hint="How far before the moment a clip may start.">{(p) => <input {...p} type="number" min={20} max={180} step={10} className="field num" value={form.live.lookback_sec} onChange={(e) => set("live", "lookback_sec", num(e.target.value, 60))} />}</Field>
                 <Field label="Gap between clips (s)">{(p) => <input {...p} type="number" min={0} max={900} step={10} className="field num" value={form.live.cooldown_sec} onChange={(e) => set("live", "cooldown_sec", num(e.target.value, 90))} />}</Field>
                 <Field label="Minimum AI score">{(p) => <input {...p} type="number" min={0} max={100} className="field num" value={form.live.min_score} onChange={(e) => set("live", "min_score", num(e.target.value, 55))} />}</Field>

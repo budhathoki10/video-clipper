@@ -75,11 +75,16 @@ def analyze(wav: Path, words: list[dict[str, Any]],
     return _smooth(score, 5).astype(np.float32)
 
 
-def candidates(score: np.ndarray, *, spacing: int, limit: int) -> list[dict[str, float]]:
-    """Top peaks of the score, at least `spacing` seconds apart."""
+SUSTAIN_SEC = 15  # moments are ranked by how excited a stretch this long is, not by its loudest second
+
+
+def candidates(score: np.ndarray, *, spacing: int, limit: int,
+               sustain: int = SUSTAIN_SEC) -> list[dict[str, float]]:
+    """Top moments, at least `spacing` seconds apart. They are ranked by the average over `sustain`
+    seconds, so excitement that holds wins over one sudden noise (a cough, a bang, a random shout)."""
     if score.size == 0:
         return []
-    remaining = score.copy()
+    remaining = _smooth(score, sustain) if sustain > 1 else score.copy()
     picks: list[dict[str, float]] = []
     floor = float(np.min(score)) - 1.0
     for _ in range(limit):
