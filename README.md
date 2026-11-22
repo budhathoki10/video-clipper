@@ -1,7 +1,8 @@
 # Clipper
 
 Turns long YouTube videos and live streams into captioned clips that are ready to post.
-The engine runs on this PC in the background; finished clips are kept in private storage.
+It finds the strongest moments, trims them, adds word-by-word captions and a hook, ranks them, and
+posts them to your YouTube channel. The engine runs in the background on this PC or on a server.
 Full documentation for developers and coding agents: `docs/DOCUMENTATION.md` (rules in `AGENTS.md`).
 
 ## Start and stop
@@ -19,11 +20,12 @@ on; the worker keeps Windows awake while jobs are running.
 ## What it does
 
 1. **Paste a link** on Home. A finished video is never downloaded whole: its sound is analysed and each clip fetches only its own part. A stream that is live right now is watched until it ends, or until it has the number of clips you asked for.
-2. **Find moments.** Speech is transcribed on the graphics card. Loudness, sudden jumps, speaking speed and YouTube's "most replayed" data mark candidate moments.
+2. **Find moments.** Speech is transcribed on the graphics card, ten minutes at a time. Loudness, sudden jumps, speaking speed and YouTube's "most replayed" data mark candidate moments. A video longer than 2 hours is transcribed only around its strongest moments, so a 10-hour stream takes minutes instead of hours.
 3. **AI picks and trims** the candidates, writes a title, on-screen hook, description and hashtags, guided by the current trend profile.
-4. **Render.** Each clip is cut in the chosen format (9:16, 16:9, 1:1) and quality, with word-by-word captions, the hook and a credit to the source channel.
-5. **Audience panel.** Up to 100 simulated viewers react to each clip; their answers become a 0-100 score used to rank clips.
-6. **Post** now or on a schedule to your connected YouTube channel, or download the file.
+4. **Render.** Each clip is cut in the chosen format (9:16, 16:9, 1:1), layout and quality, with word-by-word captions, the hook and a credit to the source channel. With a webcam in the video, the default vertical layout shows it in a small corner window over the action; stacked, card, bubble and other layouts are in Settings.
+5. **Fix captions.** Speech recognition gets names and slang wrong. On a clip's page, edit the caption text and the clip is rendered again with the same timing.
+6. **Audience panel.** Up to 100 simulated viewers react to each clip; their answers become a 0-100 score used to rank clips.
+7. **Post** now or on a schedule to your connected YouTube channel, or download the file.
 
 ## Settings
 
@@ -61,11 +63,11 @@ capped by quota. Downloading a clip and uploading it by hand always works.
 
 ```powershell
 cd backend
-.venv\Scripts\python -m pytest                    # everything, about 6 minutes
-.venv\Scripts\python -m pytest -m "not network"   # offline checks, about 20 seconds
+.venv\Scripts\python -m pytest                    # everything, about 8 minutes
+.venv\Scripts\python -m pytest -m "not network"   # offline checks, about a minute
 ```
 
-The full run processes the first 6 minutes of a real video end to end and
+The full run processes the first minutes of a real video end to end and
 leaves the finished clips in `data\test-run\jobs\e2e\clips` for you to watch.
 Use another video with `set CLIPPER_TEST_URL=https://youtu.be/...`.
 
@@ -78,10 +80,13 @@ transcription and rendering much faster; without one it falls back to the CPU.
 cd backend
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-copy .env.example .env      # then add your key
+copy .env.example .env      # then fill it in (see below)
 cd ..
 scripts\start.ps1
 ```
+
+`backend/.env` needs at least `MONGODB_URI`, `APP_SECRET_KEY` (encrypts saved keys and YouTube tokens),
+the Google sign-in client and `NVIDIA_API_KEY`. The storage values hold finished clips.
 
 Open the dashboard and sign in with Google. Everyone who signs in has their own private workspace,
 their own settings and AI keys, and connects their own YouTube channel. There is no administrator.
@@ -98,11 +103,15 @@ backend/app/
   live.py        live-stream watcher
   llm.py         one interface over NVIDIA, Claude, Gemini, Ollama
   youtube.py     channel sign-in, upload, schedule, view counts
-  pipeline/      download, transcribe, signals, selection, captions, render, panel, trends
-backend/tests/   test_e2e.py
+  auth.py        Google sign-in and sessions
+  db.py          MongoDB access
+  keys.py        encrypted per-person AI keys and YouTube tokens
+  storage.py     remote file storage for clips
+  pipeline/      media, transcribe, signals, facecam, selection, captions, render, panel, trends
+backend/tests/   test_e2e.py, test_layout.py, test_long_videos.py, test_caption_editor.py
 frontend/        Next.js dashboard, exported to static files and served by the API
-scripts/         start, stop, autostart
-data/            videos, clips, database, tokens (not in git)
+scripts/         start, stop, autostart, home-worker
+data/            scratch space for running jobs, emptied when a job ends (not in git)
 ```
 
 ## Things to know
