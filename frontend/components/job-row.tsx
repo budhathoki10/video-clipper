@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { api, formatDuration, timeAgo, type Job } from "@/lib/api";
+import { hideLocally, isHidden, showAgain } from "@/lib/optimistic";
 import { Badge, Button, Dialog, Field, Progress, Toggle, useToast } from "./ui";
 
 const STATUS: Record<Job["status"], { label: string; tone: "neutral" | "accent" | "ok" | "warn" | "bad" }> = {
@@ -16,9 +17,12 @@ const STATUS: Record<Job["status"], { label: string; tone: "neutral" | "accent" 
   cancelled: { label: "Cancelled", tone: "neutral" },
 };
 
-export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
+export function JobRow({ job: serverJob, onChange }: { job: Job; onChange: () => void }) {
   const toast = useToast();
-  const [busy, setBusy] = useState<string | null>(null);
+  // What the screen shows right away, until the server's own answer catches up.
+  const [expected, setExpected] = useState<{ from: Job["status"]; to: Job["status"] } | null>(null);
+  const [removed, setRemoved] = useState(false);
+  const job = expected && serverJob.status === expected.from ? { ...serverJob, status: expected.to } : serverJob;
   const [confirm, setConfirm] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [moreCount, setMoreCount] = useState(3);
@@ -31,33 +35,38 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
   const live = job.kind === "live";
   const status = live && job.status === "running" ? { label: "Live", tone: "bad" as const } : STATUS[job.status];
 
+  /** Shows the result at once and does the work in the background; a failure puts things back. */
   async function act(name: string, path: string, method: string, done: string) {
-    setBusy(name);
+    const change = name === "stop" ? { from: job.status, to: live ? ("stopping" as const) : ("cancelled" as const) }
+      : name === "retry" ? { from: job.status, to: "queued" as const } : null;
+    setConfirm(false);
+    if (name === "delete") { hideLocally(job.id); setRemoved(true); }
+    if (change) setExpected(change);
+    toast(done);
     try {
       await api(path, { method });
-      toast(done);
-      onChange();
     } catch (err) {
-      toast(err instanceof Error ? err.message : "Something went wrong.", "bad");
+      if (name === "delete") { showAgain(job.id); setRemoved(false); }
+      setExpected(null);
+      toast(err instanceof Error ? err.message : "Something went wrong. Nothing was changed.", "bad");
     } finally {
-      setBusy(null);
-      setConfirm(false);
+      onChange();
     }
   }
 
   async function makeMore() {
-    setBusy("more");
+    setMoreOpen(false);
+    toast("Looking for more moments. This keeps going if you close the page.");
     try {
       await api(`/api/jobs/${job.id}/more`, { method: "POST", json: { count: moreCount, label_part: labelPart } });
-      toast("Looking for more moments. This keeps going if you close the page.");
-      setMoreOpen(false);
-      onChange();
     } catch (err) {
       toast(err instanceof Error ? err.message : "Could not start.", "bad");
     } finally {
-      setBusy(null);
+      onChange();
     }
   }
+
+  if (removed || isHidden(job.id)) return null;
 
   return (
     <li className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
@@ -106,7 +115,7 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
           </Link>
         )}
         {moreActive && more && more.status !== "stopping" && (
-          <Button loading={busy === "stopMore"} onClick={() => act("stopMore", `/api/jobs/${more.id}/stop`, "POST", "Stopped looking for more clips.")}>
+          <Button onClick={() => act("stopMore", `/api/jobs/${more.id}/stop`, "POST", "Stopped looking for more clips.")}>
             <Square /> Cancel
           </Button>
         )}
@@ -116,12 +125,12 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
           </Button>
         )}
         {active && (
-          <Button loading={busy === "stop"} onClick={() => act("stop", `/api/jobs/${job.id}/stop`, "POST", live ? "Stopping the watch. Clips are kept." : "Job cancelled.")}>
+          <Button onClick={() => act("stop", `/api/jobs/${job.id}/stop`, "POST", live ? "Stopping the watch. Clips are kept." : "Job cancelled.")}>
             <Square /> {live ? "Stop watching" : "Cancel"}
           </Button>
         )}
         {(job.status === "failed" || job.status === "cancelled") && (
-          <Button loading={busy === "retry"} onClick={() => act("retry", `/api/jobs/${job.id}/retry`, "POST", "Job queued again.")}>
+          <Button onClick={() => act("retry", `/api/jobs/${job.id}/retry`, "POST", "Job queued again.")}>
             <RotateCw /> Retry
           </Button>
         )}
@@ -138,7 +147,7 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
         footer={
           <>
             <Button onClick={() => setMoreOpen(false)}>Cancel</Button>
-            <Button variant="primary" loading={busy === "more"} onClick={makeMore}>
+            <Button variant="primary" onClick={makeMore}>
               Find more clips
             </Button>
           </>
@@ -169,7 +178,7 @@ export function JobRow({ job, onChange }: { job: Job; onChange: () => void }) {
         footer={
           <>
             <Button onClick={() => setConfirm(false)}>Keep</Button>
-            <Button variant={hasClips ? "primary" : "danger"} loading={busy === "delete"} onClick={() => act("delete", `/api/jobs/${job.id}`, "DELETE", hasClips ? "Removed. Your clips are kept." : "Deleted.")}>
+            <Button variant={hasClips ? "primary" : "danger"} onClick={() => act("delete", `/api/jobs/${job.id}`, "DELETE", hasClips ? "Removed. Your clips are kept." : "Deleted.")}>
               {hasClips ? "Remove video" : "Delete"}
             </Button>
           </>

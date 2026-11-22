@@ -18,7 +18,7 @@ on; the worker keeps Windows awake while jobs are running.
 
 ## What it does
 
-1. **Paste a link** on Home. A finished video is downloaded; a stream that is live right now is watched until it ends.
+1. **Paste a link** on Home. A finished video is never downloaded whole: its sound is analysed and each clip fetches only its own part. A stream that is live right now is watched until it ends, or until it has the number of clips you asked for.
 2. **Find moments.** Speech is transcribed on the graphics card. Loudness, sudden jumps, speaking speed and YouTube's "most replayed" data mark candidate moments.
 3. **AI picks and trims** the candidates, writes a title, on-screen hook, description and hashtags, guided by the current trend profile.
 4. **Render.** Each clip is cut in the chosen format (9:16, 16:9, 1:1) and quality, with word-by-word captions, the hook and a credit to the source channel.

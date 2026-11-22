@@ -2,8 +2,8 @@
 
 Two cases matter:
 - a **webcam overlay** (a streamer's camera in a corner of gameplay): a small face that stays in the
-  same place near an edge of the frame for the whole clip. The clip is then split: the webcam on top,
-  the action below.
+  same place near an edge of the frame for the whole clip. The action then fills the vertical clip and
+  the webcam floats in a rounded window in the top-left corner (picture in picture).
 - a **speaker** filling much of the frame (podcast, talking head): the vertical crop follows the face
   instead of the centre.
 
@@ -28,8 +28,18 @@ MIN_SHARE = 0.6  # the face must be found in the same place in this share of the
 CAM_MAX_WIDTH = 0.2  # a webcam face is at most this share of the frame width
 SPEAKER_MIN_WIDTH = 0.12  # a speaker's face is at least this share of the frame width
 EDGE_BAND = 0.3  # a webcam overlay sits within this share of the frame from an edge
-CAM_MIN_SHARE, CAM_MAX_SHARE = 0.28, 0.45  # the webcam panel's share of a split clip's height
-MAX_UPSCALE = 3.0  # a webcam smaller than out_w / this is shown smaller, not blown up into blocks
+MAX_UPSCALE = 3.0  # a small webcam is enlarged at most this much, not blown up into blocks
+# The webcam window of the picture-in-picture layout, as shares of the output frame.
+PIP_WIDTH = 0.252  # width of the window (40% smaller than the first version, 0.42)
+PIP_MAX_HEIGHT = 0.168  # the window is never taller than this
+PIP_ASPECT = (0.75, 16 / 9)  # the window keeps the webcam's shape, between portrait 3:4 and 16:9
+PIP_MARGIN = 0.04  # gap to the left edge
+PIP_TOP = 0.045  # gap to the top edge, below the source credit line
+PIP_RADIUS = 0.03  # corner radius
+PIP_BORDER = 0.004  # thin light border around the window
+STACK_MAX_HEIGHT = 0.4  # the webcam band of the stacked layout is at most this share of the height
+STACK_ASPECT = (1.2, 16 / 9)  # the band's shape: landscape, between 6:5 and 16:9
+PIP_FACE_WIDTHS = 4.0  # the window shows at most this many face widths across (head and shoulders)
 STILL = 6.0  # brightness change (0-255) below which a pixel counts as still across the sampled frames
 
 
@@ -187,36 +197,149 @@ def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
 
 
-def split_geometry(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int) -> dict[str, Any]:
-    """Crops for the split layout: the whole webcam on top, the middle of the action below.
+def _action_crop(src_w: int, src_h: int, out_w: int, out_h: int, cam: tuple[float, float]) -> tuple[float, float, float, float]:
+    """The part of the source that fills the whole output: the middle, moved sideways off the webcam
+    when the middle would show it a second time behind the webcam window. (w, h, x, y) in pixels."""
+    aspect = out_w / out_h
+    gw = min(src_h * aspect, src_w)
+    gh = gw / aspect
+    lo, hi = cam
+    middle = (src_w - gw) / 2
+    options = [middle, hi, lo - gw]  # centred, just right of the webcam, just left of it
+    clear = [x for x in options if 0 <= x <= src_w - gw and (x >= hi or x + gw <= lo)]
+    gx = min(clear, key=lambda x: abs(x - middle)) if clear else middle
+    return gw, gh, gx, (src_h - gh) / 2
 
-    The webcam panel takes the webcam's own shape (28-45% of the height); the crop stays inside the
-    webcam so no game shows in it. A small webcam is not enlarged more than MAX_UPSCALE times: it is
-    shown smaller, centred over a blurred copy of itself. Boxes are source pixels (w, h, x, y)."""
+
+def _cam_crop(face: dict[str, Any], src_w: int, src_h: int, aspect_range: tuple[float, float],
+              face_widths: float = PIP_FACE_WIDTHS) -> tuple[float, float, float, float, float, float, float]:
+    """The crop of the webcam to show, keeping its own shape (clamped to `aspect_range`) and the face
+    inside it, never leaving the webcam box so no game shows in it. Returns
+    (cw, ch, cx, cy, aspect, box_x, box_width) in source pixels."""
     box = face.get("box") or {"x": face["x"] - face["w"], "y": face["y"] - 0.6 * face["h"],
                               "w": face["w"] * 3, "h": face["h"] * 2.4}
     bx, by = _clamp(box["x"], 0, 1) * src_w, _clamp(box["y"], 0, 1) * src_h
-    bw = min(box["w"] * src_w, src_w - bx)
-    bh = min(box["h"] * src_h, src_h - by)
-    top_h = _even(_clamp(out_w / max(bw / bh, 0.1), out_h * CAM_MIN_SHARE, out_h * CAM_MAX_SHARE))
-    bottom_h = out_h - top_h
-    # Fit the panel's shape inside the webcam box, keeping the face in view.
-    aspect = out_w / top_h
+    bw = max(min(box["w"] * src_w, src_w - bx), 2)
+    bh = max(min(box["h"] * src_h, src_h - by), 2)
+    aspect = _clamp(bw / bh, *aspect_range)
+    # Fit the window's shape inside the webcam box, keeping the face in view.
     cw, ch = (bh * aspect, bh) if bw / bh > aspect else (bw, bw / aspect)
+    # A cut-out webcam (no frame around it) gives a box far larger than the person: frame the person.
+    most = face["w"] * src_w * face_widths
+    if cw > most:
+        cw, ch = most, most / aspect
     fx, fy = (face["x"] + face["w"] / 2) * src_w, (face["y"] + face["h"] / 2) * src_h
     cx = _clamp(fx - cw / 2, bx, bx + bw - cw)
-    cy = _clamp(fy - ch * 0.45, by, by + bh - ch)
-    # How wide the webcam is drawn: full width, unless that would blow it up more than MAX_UPSCALE.
-    draw_w = _even(min(out_w, cw * MAX_UPSCALE))
-    draw_h = _even(min(top_h, draw_w / aspect))
-    # Action crop: the middle of the frame, shaped like the bottom panel.
-    gaspect = out_w / bottom_h
-    gw = min(src_h * gaspect, src_w)
-    gh = gw / gaspect
-    gx, gy = (src_w - gw) / 2, (src_h - gh) / 2
+    cy = _clamp(fy - ch * 0.4, by, by + bh - ch)
+    return cw, ch, cx, cy, aspect, bx, bw
+
+
+def _pad(out_w: int) -> int:
+    """Room around a floating window for its border and soft shadow."""
+    return max(int(out_w * 0.04), 6)
+
+
+def pip_geometry(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int,
+                 side: str = "left", shape: str = "rect") -> dict[str, Any]:
+    """The picture-in-picture layout: the action fills the frame and the whole webcam floats in a
+    small window in the top corner (`side` "left" or "right"), like the self view of a video call.
+    `shape` "circle" makes the window a round bubble.
+
+    The window keeps the webcam's own shape (between portrait 3:4 and 16:9), is PIP_WIDTH of the
+    output wide and at most PIP_MAX_HEIGHT tall, and never enlarges the webcam more than MAX_UPSCALE
+    times. Boxes are pixels (w, h, x, y): "cam" and "game" in the source, "window" in the output."""
+    circle = shape == "circle"
+    cw, ch, cx, cy, aspect, bx, bw = _cam_crop(face, src_w, src_h, (1.0, 1.0) if circle else PIP_ASPECT)
+    pw = min(out_w * PIP_WIDTH * (0.85 if circle else 1.0), out_h * PIP_MAX_HEIGHT * aspect, cw * MAX_UPSCALE)
+    pw, ph = _even(pw), _even(pw / aspect)
+    margin = _even(out_w * PIP_MARGIN)
+    top = _even(out_h * PIP_TOP)
+    gw, gh, gx, gy = _action_crop(src_w, src_h, out_w, out_h, (bx, bx + bw))
+    left = out_w - pw - margin if side == "right" else margin
     return {"cam": (_even(cw), _even(ch), int(cx), int(cy)),
             "game": (_even(gw), _even(gh), int(gx), int(gy)),
-            "top_h": top_h, "bottom_h": bottom_h, "draw": (draw_w, draw_h)}
+            "window": (pw, ph, left, top), "pad": _pad(out_w),
+            "radius": pw // 2 if circle else max(int(out_w * PIP_RADIUS), 4),
+            "border": max(int(out_w * PIP_BORDER), 2)}
+
+
+def stack_geometry(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int,
+                   share: float | None = None) -> dict[str, Any]:
+    """The stacked layout: the webcam fills a band across the top, the action fills the rest.
+    Boxes are pixels (w, h, x, y); "band" is the webcam band's (width, height) in the output."""
+    # "split" (share given) frames the person large, like a close-up, and keeps the picture clean.
+    cw, ch, cx, cy, aspect, bx, bw = _cam_crop(face, src_w, src_h, STACK_ASPECT, 3.2 if share else PIP_FACE_WIDTHS)
+    band_h = _even(out_h * share) if share else _even(min(out_w / aspect, out_h * STACK_MAX_HEIGHT))
+    # The crop was shaped for `aspect`; reshape it to the band so nothing is stretched.
+    band_aspect = out_w / band_h
+    if cw / ch > band_aspect:
+        cw = ch * band_aspect
+    else:
+        ch = cw / band_aspect
+    cx = _clamp(cx, 0, src_w - cw)
+    cy = _clamp(cy, 0, src_h - ch)
+    game_h = out_h - band_h
+    gw, gh, gx, gy = _action_crop(src_w, src_h, out_w, game_h, (bx, bx + bw))
+    return {"cam": (_even(cw), _even(ch), int(cx), int(cy)),
+            "game": (_even(gw), _even(gh), int(gx), int(gy)),
+            "band": (out_w, band_h), "game_size": (out_w, game_h),
+            "soft": not share,  # the blurred edge is for stacked webcams; a split is left clean
+            "divider": max(int(out_w * 0.006), 2) if share else 0}  # a thin white line between the halves
+
+
+def card_geometry(src_w: int, src_h: int, out_w: int, out_h: int) -> dict[str, Any]:
+    """The card layout: the whole source as a rounded card across the width, centred on a blurred copy."""
+    pw = _even(out_w * 0.94)
+    ph = _even(pw * src_h / src_w)
+    return {"window": (pw, ph, (out_w - pw) // 2, _even((out_h - ph) / 2)),
+            "pad": _pad(out_w), "radius": max(int(out_w * 0.03), 4), "border": max(int(out_w * PIP_BORDER), 2)}
+
+
+def cards_geometry(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int) -> dict[str, Any]:
+    """Two rounded cards on a blurred background: the webcam on top, the action below it.
+    Each is {"window": (w, h, x, y), ...} in the output; "cam" and "game" are source crops (w, h, x, y)."""
+    cw, ch, cx, cy, aspect, bx, bw = _cam_crop(face, src_w, src_h, STACK_ASPECT)
+    card_w = _even(out_w * 0.92)
+    x = (out_w - card_w) // 2
+    top = _even(out_h * 0.06)
+    cam_h = _even(min(card_w / aspect, out_h * 0.3))
+    gap = _even(out_h * 0.02)
+    game_h = _even(out_h * 0.94 - top - cam_h - gap)
+    gw, gh, gx, gy = _action_crop(src_w, src_h, card_w, game_h, (bx, bx + bw))
+    # reshape the webcam crop to the card so nothing is stretched
+    card_aspect = card_w / cam_h
+    if cw / ch > card_aspect:
+        cw = ch * card_aspect
+    else:
+        ch = cw / card_aspect
+    cx, cy = _clamp(cx, 0, src_w - cw), _clamp(cy, 0, src_h - ch)
+    common = {"pad": _pad(out_w), "radius": max(int(out_w * 0.03), 4), "border": max(int(out_w * PIP_BORDER), 2)}
+    return {"cam": (_even(cw), _even(ch), int(cx), int(cy)), "game": (_even(gw), _even(gh), int(gx), int(gy)),
+            "cam_card": {"window": (card_w, cam_h, x, top), **common},
+            "game_card": {"window": (card_w, game_h, x, top + cam_h + gap), **common}}
+
+
+STREAMER_ASPECT = 1.3  # the shape of the picture in the streamer layout (width / height)
+STREAMER_TOP = 0.14  # gap above the picture, as a share of the output height (room for the hook title)
+
+
+def streamer_geometry(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int) -> dict[str, Any]:
+    """The streamer-in-view layout: a crop of the source, a little wider than tall, that keeps the
+    creator in the picture exactly as they appear in the video (a cut-out streamer stays cut out, with
+    no window around them). It is shown full width over a blurred copy, with room below for captions.
+    "crop" is (w, h, x, y) in the source, "window" (w, h, x, y) in the output."""
+    cw = min(float(src_w), src_h * STREAMER_ASPECT)
+    ch = min(float(src_h), cw / STREAMER_ASPECT)
+    cw = min(cw, ch * STREAMER_ASPECT)
+    fx = face["x"] + face["w"] / 2
+    x = 0.0 if fx < 0.5 else src_w - cw  # start from the side the creator sits on
+    # the whole face (and some shoulder room) must stay inside the crop
+    left = max((face["x"] - face["w"]) * src_w, 0.0)
+    right = min((face["x"] + 2 * face["w"]) * src_w, float(src_w))
+    x = _clamp(x, max(right - cw, 0), min(left, src_w - cw)) if right - cw <= min(left, src_w - cw) else x
+    y = _clamp((face["y"] + face["h"] / 2) * src_h - ch / 2, 0, src_h - ch)
+    ww, wh = out_w, _even(out_w * ch / cw)
+    return {"crop": (_even(cw), _even(ch), int(x), int(y)), "window": (ww, wh, 0, _even(out_h * STREAMER_TOP))}
 
 
 def speaker_crop(face: dict[str, Any], src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int, int, int]:

@@ -3,7 +3,9 @@
 import { ChevronDown, KeyRound } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
+import { LayoutOptions } from "@/components/layout-options";
 import { CaptionPreview } from "@/components/caption-preview";
+import { ClipCountSelect } from "@/components/clip-count";
 import { Badge, Button, ErrorState, Field, Notice, PageHeader, SkeletonRows, Toggle, cx, useToast } from "@/components/ui";
 import { api, useApi, type Provider, type SecretStatus, type Settings, type YouTubeStatus } from "@/lib/api";
 
@@ -303,7 +305,9 @@ export default function SettingsPage() {
           <div className="flex flex-col gap-4 p-4">
             {tab === "clips" && (
               <div className={GRID}>
-                <Field label="Clips per video">{(p) => <input {...p} type="number" min={1} max={20} className="field num" value={form.clip.max_clips} onChange={(e) => set("clip", "max_clips", num(e.target.value, 5))} />}</Field>
+                <Field label="Clips per video or stream" hint="As many as found keeps clips the AI scores 60 or more, up to 30. A stream stops once it has the number you pick.">
+                  {(p) => <ClipCountSelect {...p} value={form.clip.max_clips} onChange={(count) => set("clip", "max_clips", count)} />}
+                </Field>
                 <Field label="Shortest (seconds)">{(p) => <input {...p} type="number" min={5} max={180} className="field num" value={form.clip.min_sec} onChange={(e) => set("clip", "min_sec", num(e.target.value, 20))} />}</Field>
                 <Field label="Longest (seconds)">{(p) => <input {...p} type="number" min={5} max={180} className="field num" value={form.clip.max_sec} onChange={(e) => set("clip", "max_sec", num(e.target.value, 60))} />}</Field>
                 <Field label="Minimum AI score" hint="0 keeps every pick.">{(p) => <input {...p} type="number" min={0} max={100} className="field num" value={form.clip.min_score} onChange={(e) => set("clip", "min_score", num(e.target.value, 0))} />}</Field>
@@ -337,9 +341,7 @@ export default function SettingsPage() {
                 <Field label="Layout" className="col-span-2">
                   {(p) => (
                     <select {...p} className="field" value={form.format.layout} onChange={(e) => set("format", "layout", e.target.value as Settings["format"]["layout"])}>
-                      <option value="auto">Automatic: creator&apos;s face on top when there is a webcam</option>
-                      <option value="blur">Whole frame on a blurred background</option>
-                      <option value="crop">Crop to fill the screen</option>
+                      <LayoutOptions />
                     </select>
                   )}
                 </Field>

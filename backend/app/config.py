@@ -45,7 +45,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
              "context_sec": 5},  # added before and after each moment so viewers see what led up to it
     "format": {
         "aspect": "9:16",  # 9:16 | 16:9 | 1:1
-        "layout": "auto",  # auto (finds the creator's face) | blur | crop
+        "layout": "auto",  # auto | blur | crop | corner | stack | card | speaker
         "zoom": 1.0,  # foreground zoom for the blur layout; 1 keeps the full width (a corner webcam stays in)
         "quality": 1080,  # short side of the output, px
         "fps": 30,

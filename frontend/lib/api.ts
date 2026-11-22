@@ -70,9 +70,23 @@ export interface Clip {
   source_url: string | null;
   format: Settings["format"];
   captions: Settings["captions"];
+  captions_edited: boolean;
   error: string | null;
   created_at: number;
   posts?: Post[];
+}
+
+/** One caption line as shown on screen. Times are seconds from the start of the clip. */
+export interface CaptionLine {
+  s: number;
+  e: number;
+  text: string;
+}
+
+export interface CaptionLines {
+  lines: CaptionLine[];
+  duration: number;
+  edited: boolean;
 }
 
 export type ClipSummary = Pick<Clip, "id" | "status" | "title" | "duration" | "panel_score" | "ai_score" | "thumb_url" | "source_channel">;
@@ -107,7 +121,7 @@ export interface Settings {
   clip: { min_sec: number; max_sec: number; max_clips: number; min_score: number; context_sec: number };
   format: {
     aspect: "9:16" | "16:9" | "1:1";
-    layout: "auto" | "blur" | "crop";
+    layout: "auto" | "blur" | "crop" | "corner" | "corner_right" | "bubble" | "stack" | "split" | "cards" | "streamer" | "card" | "speaker";
     zoom: number;
     quality: number;
     fps: number;

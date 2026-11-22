@@ -91,10 +91,16 @@ def test_signals_find_the_loud_moment(tmp_path):
             handle.writeframes(b"".join(
                 struct.pack("<h", int(level * math.sin(2 * math.pi * 220 * n / rate)))
                 for n in range(rate)))
-    score = signals.analyze(wav, words=[])
+    levels = signals.loudness_per_second(wav)
+    score = signals.analyze(levels, words=[])
     picks = signals.candidates(score, spacing=30, limit=3)
     best = max(picks, key=lambda p: p["signal"])
     assert 36 <= best["peak"] <= 48, f"loud burst at 40-46 s, found peak at {best['peak']}"
+    # Any sound file is measured the same way, decoded as it is read (a linked video's audio track).
+    compressed = tmp_path / "tone.m4a"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-c:a", "aac", str(compressed)], check=True)
+    other = signals.loudness_per_second(compressed)
+    assert abs(other.size - levels.size) <= 1 and abs(float(other[42]) - float(levels[42])) < 1.5
 
 
 @pytest.mark.parametrize("aspect,layout,size", [
@@ -154,6 +160,21 @@ def test_api_rejects_bad_input(client):
     bad = client.put("/api/settings", json={"clip": {"min_sec": 90, "max_sec": 30}})
     assert bad.status_code == 422 and "longer" in bad.json()["detail"]
     assert client.post("/api/posts", json={"clip_id": "missing"}).status_code == 404
+    for count in (-1, 21, 2.5, "5"):
+        refused = client.put("/api/settings", json={"clip": {"max_clips": count}})
+        assert refused.status_code == 422 and "Clips to make" in refused.json()["detail"], count
+        assert client.post("/api/jobs", json={"url": "https://youtu.be/x", "options": {"clip": {"max_clips": count}}}
+                           ).status_code == 422, count
+
+
+def test_as_many_clips_as_found_can_be_chosen_for_a_video_or_stream(client):
+    made = client.post("/api/jobs", json={"url": "https://youtu.be/many", "options": {"clip": {"max_clips": 0}}})
+    assert made.status_code == 201, made.text
+    assert db.find_one("jobs", {"id": made.json()["id"]})["options"]["clip"]["max_clips"] == 0
+    db.delete("jobs", {"id": made.json()["id"]})
+    saved = client.put("/api/settings", json={"clip": {"max_clips": 0}})
+    assert saved.status_code == 200 and saved.json()["settings"]["clip"]["max_clips"] == 0
+    client.put("/api/settings", json={"clip": {"max_clips": 5}})
 
 
 def test_accounts_protect_the_app(monkeypatch):
@@ -280,8 +301,8 @@ def test_full_pipeline_on_a_real_video():
     if storage.enabled():  # a processed video leaves nothing on this server
         assert not (config.JOBS_DIR / job_id).exists(), "the working folder was not cleared"
         files = job["files"]
-        assert files and files["source"] and files["artifacts"], "the video and its working files were not stored"
-        assert runner.restore_job_files(job_id, source=True).stat().st_size > 100_000, "the stored video is unusable"
+        assert files and files["artifacts"], "the working files were not stored"
+        assert not files["source"], "a link is never downloaded whole, so there is no video to store"
     transcript = runner.job_dir(job_id) / "transcript.json"
     runner.restore_job_files(job_id)
     assert transcript.exists()
@@ -668,7 +689,7 @@ def test_more_clips_skip_used_moments_and_continue_the_numbering(tmp_path, monke
                     "-f", "lavfi", "-i", "sine=frequency=330:duration=70", "-c:v", "libx264", "-preset", "ultrafast",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", str(source)], check=True)
     monkeypatch.setattr(storage, "enabled", lambda: False)
-    monkeypatch.setattr(media, "download", lambda *a, **k: pytest.fail("the source is on disk, no download"))
+    monkeypatch.setattr(media, "download_section", lambda *a, **k: pytest.fail("the source is on disk, no download"))
 
     def pick(start, end, score, title):
         return {"start": start, "end": end, "title": title, "hook": "A hook", "description": "d",
@@ -1330,9 +1351,10 @@ def test_a_video_file_can_be_uploaded_instead_of_a_link(tmp_path, monkeypatch):
     def reached_audio(*args, **kwargs):
         raise Stop
 
-    monkeypatch.setattr(media, "download", forbidden)
+    monkeypatch.setattr(media, "download_audio", forbidden)
+    monkeypatch.setattr(media, "download_section", forbidden)
     monkeypatch.setattr(media, "fetch_info", forbidden)
-    monkeypatch.setattr(media, "extract_audio", reached_audio)
+    monkeypatch.setattr(signals, "loudness_per_second", reached_audio)
     with pytest.raises(Stop):
         runner.process_video(db.find_one("jobs", {"id": job["id"]}))
     shutil.rmtree(folder)  # and if the file is gone it says so instead of trying to download
