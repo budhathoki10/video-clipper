@@ -58,11 +58,43 @@ def group_words(words: list[dict[str, Any]], per_line: int) -> list[list[dict[st
     return groups
 
 
+MAX_LINE_CHARS = 200
+
+
+def lines_for(words: list[dict[str, Any]], per_line: int) -> list[dict[str, Any]]:
+    """The caption lines of a clip as they appear on screen, for editing: start, end and text."""
+    return [{"s": round(group[0]["s"], 2), "e": round(group[-1]["e"], 2), "text": " ".join(w["w"] for w in group)}
+            for group in group_words(words, max(int(per_line), 1))]
+
+
+def words_from_lines(lines: list[dict[str, Any]], recognised: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Words with times from edited caption lines. A line keeps its recognised word times when it
+    still has as many words (a spelling fix); otherwise its words share the line's time evenly.
+    An emptied line shows nothing."""
+    out: list[dict[str, Any]] = []
+    for line in sorted(lines, key=lambda line: line["s"]):
+        start, end = float(line["s"]), float(line["e"])
+        tokens = str(line["text"]).split()
+        if not tokens or end <= start:
+            continue
+        same = [w for w in recognised if w["s"] >= start - 0.01 and w["e"] <= end + 0.01]
+        if len(same) == len(tokens):
+            out += [{"w": t, "s": w["s"], "e": w["e"]} for t, w in zip(tokens, same)]
+        else:
+            step = (end - start) / len(tokens)
+            out += [{"w": t, "s": round(start + i * step, 3), "e": round(start + (i + 1) * step, 3)}
+                    for i, t in enumerate(tokens)]
+    return out
+
+
 def build_ass(*, words: list[dict[str, Any]], width: int, height: int, duration: float,
               captions: dict[str, Any], title: str = "", credit: str = "",
-              title_all_clip: bool = False, title_top: float | None = None) -> str:
+              title_all_clip: bool = False, title_top: float | None = None,
+              caption_center: float | None = None) -> str:
     """`words` use clip-relative times in seconds. `title_top` (a share of the height) moves the hook
-    title down, for example below a webcam panel so it does not cover the creator's face."""
+    title down, for example below a webcam panel so it does not cover the creator's face.
+    `caption_center` (a share of the height) centres the captions on that line, for example the seam
+    between two halves."""
     base = min(width, height)
     vertical = height > width
     cap_size = int(base * SIZE_FACTOR.get(captions.get("size", "medium"), 0.075))
@@ -131,5 +163,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                      f"{{\\c{primary}&\\fscx100\\fscy100}}") if i == wi else tok
                     for i, tok in enumerate(tokens)
                 ]
-                add(start, min(end, duration), "Caption", "{\\blur0.6}" + " ".join(parts))
+                place = f"\\an5\\pos({width // 2},{int(height * caption_center)})" if caption_center is not None else ""
+                add(start, min(end, duration), "Caption", "{" + place + "\\blur0.6}" + " ".join(parts))
     return head + "\n".join(events) + "\n"

@@ -20,7 +20,7 @@ YouTube channel immediately or on a schedule, all without staying in front of th
 
 | Capability | Summary |
 |---|---|
-| Paste a link | A finished video is downloaded and cut into its strongest moments. A stream that is live right now is watched until it ends. The app detects which it is. |
+| Paste a link | A finished video is cut into its strongest moments, found from its sound; only each clip's part of the picture is downloaded. A stream that is live right now is watched until it ends. The app detects which it is. |
 | Best-moment selection | Free audio and speech signals find candidates; the AI reads the whole transcript, proposes moments, then ranks them side by side. |
 | Editing | Reframes to 9:16 / 16:9 / 1:1, word-by-word animated captions, an on-screen hook line, a source credit, loudness normalisation. |
 | Audience panel | Up to 100 simulated viewers react to each clip; their answers become a 0-100 score. |
@@ -120,7 +120,7 @@ backend/
     db.py                      MongoDB access, indexes, settings storage
     keys.py                    encrypted per-person API keys and YouTube tokens
     pipeline/
-      media.py                 yt-dlp + ffmpeg helpers (probe, download, audio, encoder choice)
+      media.py                 yt-dlp + ffmpeg helpers (probe, audio-only and per-clip downloads, decoding, encoder)
       transcribe.py            word-level transcription
       signals.py               loudness / jump / speech-rate / "most replayed" scoring
       selection.py             AI moment selection, ranking, hook writing
@@ -146,17 +146,30 @@ asks yt-dlp whether the link is live now, then re-queues it as `video` or `live`
 ### `video` jobs: `runner.process_video`
 Each step writes its output into `data/jobs/<job_id>/` so a restart resumes instead of repeating.
 
+**A linked video is never downloaded whole.** Its sound is enough to find the moments; each clip then
+downloads only its own part of the picture. Measured on a 10-hour stream: the whole 1080p video is 16.8 GB
+(hours to download), its smallest audio track 254 MB (about 3 minutes), and one clip's minute of
+1080p video 30 MB (about 45 seconds). An uploaded file is already on the server and is read where it is.
+
 1. **Details**: `media.fetch_info` returns title, channel, duration, thumbnail, YouTube's "most replayed"
    heatmap, category and tags (`meta.json`).
-2. **Download**: `media.download` (yt-dlp, up to the chosen quality, `download.done` marks completion).
-3. **Transcribe**: audio to 16 kHz mono WAV, then faster-whisper with word timestamps
-   (`transcript.json`: `words` with `s`/`e` seconds, and sentence `segments`). The WAV is read in Python
-   and passed in as samples, so the library's own decoder (PyAV) is never used.
-4. **Signals**: `signals.analyze` scores every second from loudness, sudden loudness jumps, speaking
+2. **Sound**: for a link, `media.download_audio` fetches only the smallest audio track (yt-dlp, asked
+   in 10 MB pieces because YouTube slows one long read; `audio.done` marks completion). Reading the
+   audio address straight into ffmpeg is far slower (YouTube throttles it), so the file is downloaded.
+3. **Loudness**: `signals.loudness_per_second` decodes the sound as it reads it (`media.pcm_seconds`,
+   about a minute for ten hours) into one level per second (`levels.json`). No WAV is written.
+4. **Transcribe**: faster-whisper with word timestamps, ten minutes at a time (`transcribe.pieces`,
+   each cut on the quietest second near the ten-minute mark), so memory stays flat for any length
+   (`transcript.json`: `words` with `s`/`e` seconds, and sentence `segments`). Samples are decoded here
+   and passed in, so the library's own decoder (PyAV) is never used. A video longer than
+   `runner.FULL_TRANSCRIPT_SEC` (2 hours) is first ranked from its loudness and replay curve, and only
+   the stretches around its strongest moments are transcribed (`runner._speech_ranges`; `ranges` in
+   `transcript.json`). An eleven-hour stream then takes minutes instead of hours to transcribe.
+5. **Signals**: `signals.analyze` scores every second from loudness, sudden loudness jumps, speaking
    speed and the heatmap (`signals.json`). `signals.candidates` takes the top peaks at least
-   `max_sec` apart.
-5. **Trends**: `trends.brief_for(meta)` returns advice for this kind of video (section 8).
-6. **Selection** (`selection.select_clips`), in three passes:
+   `max_sec` apart. The sound file is deleted once the moments are chosen.
+6. **Trends**: `trends.brief_for(meta)` returns advice for this kind of video (section 8).
+7. **Selection** (`selection.select_clips`), in three passes:
    - *Content pass*: the transcript is read in 7-minute sections (30 s overlap); the AI proposes up to 3
      moments per section.
    - *Audio-peak pass*: the AI judges the windows around the loudest candidates, catching moments that
@@ -166,10 +179,15 @@ Each step writes its output into `data/jobs/<job_id>/` so a restart resumes inst
      each hook. A small bonus (up to 6 points) is added where the audio also peaks. Results are saved
      in `selection.json`.
    - If the AI is unavailable, clips are cut around the audio peaks and a warning is stored.
-7. **Render** (two clips at a time): `runner.make_clip` renders, stores the output (section 9), then
-   runs the audience panel.
-8. **Finish**: the job becomes `done`; the worker sends a Windows notification; the downloaded source is
-   deleted when `storage.delete_source` is on and the clips exist.
+   - `clip.max_clips` 0 means "as many as found": up to `runner.AUTO_CLIPS` (30) clips that the AI
+     scores at least `runner.AUTO_MIN_SCORE` (60) (`runner.clip_settings`).
+8. **Render** (two clips at a time): `runner.make_clip` gets the clip's video from `runner.clip_source`
+   (for a link, `media.download_section` fetches only the clip plus `SECTION_PAD` seconds each side and
+   the part is removed after rendering; `render_clip(offset=...)` maps video times onto the part),
+   renders, stores the output (section 9), then runs the audience panel. The clip's `options.url`
+   records where its part came from, so re-rendering after an edit fetches it again.
+9. **Finish**: the job becomes `done`; the worker sends a Windows notification; an upload's file is moved
+   to storage when `storage.delete_source` is on and the clips exist.
 
 ### `more` jobs: `runner.process_more`
 After a video is clipped, "More clips" (Home, on the video's row) finds further moments, for example to make a
@@ -177,7 +195,8 @@ Part 2 when the first clips did well. It reuses the saved `transcript.json`, `me
 `trends.json`, so it needs no transcription. The ranges of the clips that already exist are passed to
 `selection.select_clips(exclude=...)`, so nothing overlapping them is returned, and the content pass looks a
 little deeper. If the AI is unavailable the job fails instead of falling back to audio peaks (that would repeat
-the first pass). The source is downloaded again if it was removed. New clips are saved under the **same video**
+the first pass). Each new clip downloads only its own part of a linked video; an upload's file comes back
+from storage. New clips are saved under the **same video**
 (`clips.job_id` is the original job), optionally titled "- Part N" continuing from the clips already made. The
 job runs on the heavy lane (one at a time with `video`), and its progress is attached to the video's row in
 `GET /api/jobs` as `more`. Only one `more` job per video at a time.
@@ -188,6 +207,8 @@ job runs on the heavy lane (one at a time with `video`), and its progress is att
   from the second (`stream_urls`).
 - Each finished segment is transcribed and measured against the stream's own running baseline
   (robust z-scores of loudness and speaking rate, plus a bonus for excited phrases).
+- `clip.max_clips` caps a stream too: once that many clips are made the recorder stops and the job ends
+  ("Made the N clips you asked for"); 0 keeps clipping until the stream ends or is stopped.
 - When `live.sustain_segments` segments in a row (default 2) pass `live.sensitivity` and the cooldown
   allows, the segments around the strongest of them are concatenated, the AI trims them with the same
   selection code, and the clip is rendered while recording continues. One loud segment alone never
@@ -206,10 +227,14 @@ job runs on the heavy lane (one at a time with `video`), and its progress is att
 - **Layout** `auto` (default): `pipeline/facecam.py` samples 10 frames of the clip and looks for the
   creator's face with OpenCV's YuNet model (`assets/models`, MIT). A small face that stays in one place
   near an edge is a **webcam**: its whole overlay box is found (inside it the room stays still across
-  frames sampled up to 30 s around the clip; outside it the game moves), and a vertical clip is split:
-  the whole webcam on top (28-45% of the height, in the webcam's own shape) and the middle of the action
-  below, with the hook title just under the webcam. A small webcam is enlarged at most 3x (lanczos plus a
-  light sharpen) and centred over a blurred copy of itself rather than stretched into blocks. A large steady face is a **speaker**: the crop follows
+  frames sampled up to 30 s around the clip; outside it the game moves), and a vertical clip uses
+  **picture in picture** (`facecam.pip_geometry`): the action fills the whole frame (moved sideways if the
+  middle would show the webcam a second time) and the webcam floats in a rounded window in the top-left
+  corner, like the self view of a video call. The window keeps the webcam's shape (between 3:4 and 16:9),
+  is 42% of the width and at most 28% of the height, has a thin light border and a soft shadow (two small
+  PNGs made by `render.pip_images`, removed after rendering), and sits just under the credit line; the
+  hook title goes just below it. A cut-out webcam with no frame is framed at most 4 face widths across;
+  a small webcam is enlarged at most 3x (lanczos plus a light sharpen). A large steady face is a **speaker**: the crop follows
   it sideways. Faces in the content (they move, or sit mid-frame) are ignored. With no such face, `auto`
   is `blur` at zoom 1, so nothing is cut off. `blur`: the whole frame over a blurred, darkened copy of
   itself (optional zoom; above 1 it crops the sides). `crop`: fill the frame. A source already in the
@@ -226,6 +251,19 @@ Word-by-word: the group of up to `words_per_line` words stays on screen; the wor
 the highlight colour and pops (starts 14% larger, settles in 90 ms). Commas and full stops are dropped;
 `?` and `!` kept. Position, size, colours, font and capitals come from settings. The hook card sits at
 the top; the source credit above it.
+
+**Caption editor** (clip page, `components/caption-editor.tsx`). Speech recognition gets names and slang
+wrong, so a person can fix the words of one clip. `GET /api/clips/{id}/captions` returns the lines as the
+screen groups them (`captions.lines_for`: start, end, text; seconds from the clip's start). `PUT` saves
+the corrected lines and renders the clip again; `DELETE` goes back to the recognised words. Only the text
+changes, never a line's time, and a person cannot add or remove lines (an emptied line shows nothing).
+`captions.words_from_lines` turns lines back into timed words: a line with the same number of words as were
+recognised keeps each word's own time (a spelling fix stays in sync); otherwise its words share the line's
+time evenly. The corrected words are stored on the clip (`caption_words`, with the `caption_range` they
+replace); the transcript itself is never changed, so a clip trimmed longer later still has captions
+outside the edited stretch. `runner.clip_words` merges the two and is used by re-rendering, the audience
+panel and hook suggestions. A clip cut from a live stream cannot be edited (no recording to render
+again); the API answers 409 with the reason, and the clip page shows it.
 
 ### Hooks
 The on-screen hook is the line over the first seconds. `selection.HOOK_RULES` is the single source of
@@ -356,9 +394,10 @@ to users**: no settings, no provider names, no free-disk indicator, no storage p
 - **Posting.** `worker.run_upload` uses `storage.local_copy`, a temporary download that is removed
   afterwards.
 - **Deleting** a clip or video also deletes the stored objects (`storage.delete`, best effort).
-- **Sources.** With `delete_source` on, the downloaded source is removed once its clips exist. Editing a
-  clip's trim later downloads the source again (`runner.fetch_source_again`); clips cut from live
-  recordings cannot be re-trimmed because their recording is removed.
+- **Sources.** A linked video is never stored: each clip downloads only its own part, also when it is
+  re-rendered later (`runner.clip_source`). An uploaded file is moved to storage once its clips exist
+  (with `delete_source` on). Clips cut from live recordings cannot be re-trimmed because their recording
+  is removed.
 - **Migration.** `storage.migrate_local_clips` moves clips created before storage was on. The worker
   queues it at start-up when local clips exist (`POST /api/storage/migrate` does the same on demand).
 - **Admin check.** `POST /api/storage/test` writes, reads back through a signed link and deletes a tiny
@@ -427,6 +466,7 @@ enforces this.
 | `POST /jobs/{id}/stop`, `POST /jobs/{id}/retry`, `DELETE /jobs/{id}` | Cancel or stop a live watch; retry; remove a video from the list (its clips, their files and the small working files are kept; only its big downloaded copy goes; a video with no clips is deleted outright) |
 | `GET /clips`, `GET /clips/{id}`, `PATCH /clips/{id}`, `DELETE /clips/{id}` | Clips; PATCH edits title/hook/description/trim/format and can re-render |
 | `POST /clips/{id}/hooks` | Five alternative on-screen hooks |
+| `GET`, `PUT`, `DELETE /clips/{id}/captions` | Caption lines for the editor; save corrected lines and re-render; reset to the recognised words |
 | `GET /clips/{id}/file`, `/thumb`, `/download` | Playback, thumbnail, download (redirect to a signed link when stored remotely) |
 | `GET /settings`, `PUT /settings`, `PUT /secrets` | User settings (storage hidden) and replacing the AI keys |
 | `GET /trends`, `POST /trends/refresh` | Trend profile; queue a refresh |
@@ -540,6 +580,11 @@ Windows notes: ffmpeg filter paths are kept relative (run with `cwd`); subproces
   and a webcam that moves mid-clip is not followed. If the room behind the streamer moves, or the game
   next to the webcam stays still, an edge can be missed; that side then uses the usual 16:9 webcam shape.
 - Clips cut from live recordings cannot be re-trimmed (recording removed after clipping).
+- A video longer than 2 hours is transcribed only around its loudest moments and replay peaks, so a calm
+  but strong moment (a quiet joke, a key explanation) far from any peak can be missed. Its captions and
+  AI judgement are as good as for a short video; it is the search that is narrower.
+- The audio track of a linked video is still downloaded in full (about 25 MB an hour): loudness needs
+  every second. It is read in one stream; parallel ranged reads could make it faster.
 - One `video` job runs at a time.
 - Windows only for the helper scripts and notifications (the Python code is mostly portable).
 - Sign-in token lifetime and upload quota are controlled by Google (section 10).

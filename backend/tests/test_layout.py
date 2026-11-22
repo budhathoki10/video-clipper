@@ -1,5 +1,5 @@
-"""Vertical clips must keep the creator's face: the webcam split, the speaker crop and the full-width
-blurred layout."""
+"""Vertical clips must keep the creator's face: the webcam window (picture in picture), the speaker crop
+and the full-width blurred layout."""
 import subprocess
 
 import pytest
@@ -29,18 +29,30 @@ def test_faces_that_are_part_of_the_content_are_not_a_webcam():
     assert speaker and speaker["kind"] == "speaker", "a large face anywhere is a speaker to follow"
 
 
-def test_split_and_speaker_crops_stay_inside_the_frame():
+def test_pip_and_speaker_crops_stay_inside_the_frame():
     face = {"x": 0.86, "y": 0.10, "w": 0.087, "h": 0.19}
-    g = facecam.split_geometry(face, 1920, 1080, 1080, 1920)
+    g = facecam.pip_geometry(face, 1920, 1080, 1080, 1920)
     cw, ch, cx, cy = g["cam"]
     gw, gh, gx, gy = g["game"]
-    assert g["top_h"] + g["bottom_h"] == 1920
+    pw, ph, px, py = g["window"]
     assert 0 <= cx and cx + cw <= 1920 and 0 <= cy and cy + ch <= 1080
     assert cx <= 0.86 * 1920 and cx + cw >= (0.86 + 0.087) * 1920, "the whole face is inside the webcam crop"
     assert 0 <= gx and gx + gw <= 1920 and gh <= 1080
-    assert all(v % 2 == 0 for v in (cw, ch, gw, gh)), "even sizes for the encoder"
+    assert abs(gw / gh - 1080 / 1920) < 0.01, "the action fills the whole vertical frame"
+    assert px < 1080 * 0.1 and py < 1920 * 0.1, "the webcam window sits in the top-left corner"
+    assert pw <= 1080 * facecam.PIP_WIDTH + 2 and ph <= 1920 * facecam.PIP_MAX_HEIGHT + 2, "a small window, not a panel"
+    assert abs(pw / ph - cw / ch) < 0.05, "the window keeps the webcam's shape, nothing stretched"
+    assert all(v % 2 == 0 for v in (cw, ch, gw, gh, pw, ph)), "even sizes for the encoder"
     sw, sh, sx, sy = facecam.speaker_crop({"x": 0.05, "y": 0.2, "w": 0.2, "h": 0.4}, 1920, 1080, 1080, 1920)
     assert sx == 0 and sw <= 1920 and sh <= 1080, "a speaker near the edge is followed without leaving the frame"
+
+
+def test_the_action_behind_the_window_does_not_show_the_webcam_twice():
+    centre_cam = {"x": 0.47, "y": 0.05, "w": 0.06, "h": 0.12, "kind": "cam",
+                  "box": {"x": 0.42, "y": 0.0, "w": 0.16, "h": 0.28}}
+    gw, gh, gx, gy = facecam.pip_geometry(centre_cam, 1920, 1080, 1080, 1920)["game"]
+    lo, hi = 0.42 * 1920, 0.58 * 1920
+    assert gx >= hi - 1 or gx + gw <= lo + 1, "the action crop moves off a webcam that sits in the middle"
 
 
 @pytest.fixture()
@@ -56,13 +68,15 @@ def _settings(**fmt):
     return config.deep_merge(config.DEFAULT_SETTINGS, {"format": {"quality": 360, **fmt}})
 
 
-def test_a_clip_with_a_webcam_is_rendered_with_the_face_on_top(wide_video, tmp_path, monkeypatch):
+def test_a_clip_with_a_webcam_shows_it_in_a_corner_window(wide_video, tmp_path, monkeypatch):
     monkeypatch.setattr(facecam, "find", lambda *a, **k: {"x": 0.8, "y": 0.05, "w": 0.1, "h": 0.2, "kind": "cam"})
-    out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id="split", start=0, end=3,
+    out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id="pip", start=0, end=3,
                              words=[], settings=_settings(), title="Hook", credit="Credit: x")
-    assert out["layout"] == "split"
+    assert out["layout"] == "pip"
     info = media.probe(tmp_path / "out" / out["file"])
     assert (info["width"], info["height"]) == (360, 640)
+    assert info["duration"] < 3.5, "the still window images do not make the clip run on"
+    assert not list((tmp_path / "out").glob("*.png")), "the window images are removed after rendering"
 
 
 def test_without_a_face_the_whole_frame_is_kept(wide_video, tmp_path, monkeypatch):
@@ -112,11 +126,105 @@ def test_the_whole_webcam_box_is_found_not_just_the_face():
 def test_a_small_webcam_is_not_blown_up_into_blocks(wide_video, tmp_path, monkeypatch):
     tiny = {"x": 0.02, "y": 0.05, "w": 0.03, "h": 0.06, "kind": "cam",
             "box": {"x": 0.0, "y": 0.0, "w": 0.12, "h": 0.12}}
-    g = facecam.split_geometry(tiny, 1920, 1080, 1080, 1920)
-    assert g["draw"][0] <= g["cam"][0] * facecam.MAX_UPSCALE + 2 and g["draw"][0] < 1080, "drawn smaller, not stretched"
+    g = facecam.pip_geometry(tiny, 1920, 1080, 1080, 1920)
+    assert g["window"][0] <= g["cam"][0] * facecam.MAX_UPSCALE + 2, "drawn smaller, not stretched"
     cw, ch, cx, cy = g["cam"]
     assert cx + cw <= 0.12 * 1920 + 2 and cy + ch <= 0.12 * 1080 + 2, "the crop stays inside the webcam"
     monkeypatch.setattr(facecam, "find", lambda *a, **k: tiny)
     out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id="tiny", start=0, end=3,
                              words=[], settings=_settings(), title="Hook")
-    assert out["layout"] == "split"
+    assert out["layout"] == "pip"
+
+
+def test_a_section_of_the_video_renders_like_the_whole_video(wide_video, tmp_path):
+    """A clip is rendered from a downloaded section that starts `offset` seconds into the video."""
+    words = [{"w": "hello", "s": 101.2, "e": 101.6}, {"w": "there", "s": 101.7, "e": 102.1}]
+    out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id="sect", start=101, end=103,
+                             words=words, settings=_settings(layout="blur"), offset=100)
+    assert abs(out["duration"] - 2) < 0.05
+    ass = (tmp_path / "out" / "sect.ass").read_text(encoding="utf-8")
+    assert "0:00:00.20" in ass, "caption times are counted from the clip start, not the section start"
+
+
+CAM_FACE = {"x": 0.04, "y": 0.1, "w": 0.04, "h": 0.07, "kind": "cam",
+            "box": {"x": 0.0, "y": 0.03, "w": 0.2, "h": 0.22}}
+
+
+def test_the_corner_window_is_forty_percent_smaller():
+    assert abs(facecam.PIP_WIDTH - 0.42 * 0.6) < 0.001 and abs(facecam.PIP_MAX_HEIGHT - 0.28 * 0.6) < 0.001
+
+
+@pytest.mark.parametrize("layout,mode", [("corner", "pip"), ("corner_right", "pip"), ("bubble", "pip"),
+                                         ("stack", "stack"), ("split", "stack"), ("cards", "cards"), ("streamer", "streamer"),
+                                         ("card", "card"), ("auto", "pip"), ("blur", "blur")])
+def test_every_layout_style_renders(wide_video, tmp_path, monkeypatch, layout, mode):
+    monkeypatch.setattr(facecam, "find", lambda *a, **k: CAM_FACE)
+    out = render.render_clip(source=wide_video, out_dir=tmp_path / "out", clip_id=layout, start=0, end=2,
+                             words=[], settings=_settings(layout=layout), title="Hook")
+    assert out["layout"] == mode
+    assert (tmp_path / "out" / out["file"]).stat().st_size > 1000
+    assert not list((tmp_path / "out").glob("*.png")), "helper images are cleaned up"
+
+
+def test_stack_and_corner_fall_back_to_blur_without_a_webcam(wide_video, tmp_path, monkeypatch):
+    monkeypatch.setattr(facecam, "find", lambda *a, **k: None)
+    for layout in ("corner", "corner_right", "bubble", "stack", "split", "cards", "streamer", "speaker"):
+        plan = render.plan_layout(wide_video, media.probe(wide_video), 0, 2, 360, 640, _settings(layout=layout)["format"])
+        assert plan == {"mode": "blur", "zoom": 1.0}
+
+
+def test_stack_geometry_fills_the_frame_without_stretching():
+    g = facecam.stack_geometry(CAM_FACE, 1920, 1080, 1080, 1920)
+    bw, bh = g["band"]
+    gw, gh = g["game_size"]
+    assert bh + gh == 1920 and bw == gw == 1080 and bh <= 1920 * facecam.STACK_MAX_HEIGHT + 2
+    cw, ch, cx, cy = g["cam"]
+    assert abs(cw / ch - bw / bh) < 0.03 and cx + cw <= 1920 and cy + ch <= 1080
+    assert abs(g["game"][0] / g["game"][1] - gw / gh) < 0.02
+
+
+def test_corner_right_bubble_split_and_cards_geometry():
+    right = facecam.pip_geometry(CAM_FACE, 1920, 1080, 1080, 1920, side="right")["window"]
+    assert right[2] + right[0] <= 1080 and right[2] > 1080 / 2, "the window sits in the right corner"
+    bubble = facecam.pip_geometry(CAM_FACE, 1920, 1080, 1080, 1920, shape="circle")
+    assert bubble["window"][0] == bubble["window"][1] and bubble["radius"] == bubble["window"][0] // 2
+    split = facecam.stack_geometry(CAM_FACE, 1920, 1080, 1080, 1920, share=0.5)
+    assert split["band"][1] == 960 and split["game_size"][1] == 960
+    cards = facecam.cards_geometry(CAM_FACE, 1920, 1080, 1080, 1920)
+    cam, game = cards["cam_card"]["window"], cards["game_card"]["window"]
+    assert cam[3] + cam[1] <= game[3] and game[3] + game[1] <= 1920, "the cards do not overlap and stay inside"
+    assert abs(cards["cam"][0] / cards["cam"][1] - cam[0] / cam[1]) < 0.03
+
+
+def test_the_streamer_stays_in_view_without_a_window():
+    cutout = {"x": 0.86, "y": 0.62, "w": 0.09, "h": 0.2, "kind": "cam"}  # a cut-out streamer, bottom right
+    g = facecam.streamer_geometry(cutout, 1920, 1080, 1080, 1920)
+    cw, ch, cx, cy = g["crop"]
+    assert cx + cw <= 1920 and cy + ch <= 1080
+    assert cx <= 0.86 * 1920 and cx + cw >= 0.95 * 1920, "the whole streamer is inside the picture"
+    ww, wh, wx, wy = g["window"]
+    assert ww == 1080 and abs(ww / wh - cw / ch) < 0.02 and wy + wh < 1920 * 0.7, "full width, room for captions below"
+    left = facecam.streamer_geometry({"x": 0.03, "y": 0.1, "w": 0.09, "h": 0.2, "kind": "cam"}, 1920, 1080, 1080, 1920)
+    assert left["crop"][2] == 0, "a streamer on the left starts the crop at the left edge"
+
+
+def test_a_slow_download_helper_is_retried_not_fatal(monkeypatch):
+    """The token helper (node) timing out on a busy server must not fail the whole job."""
+    monkeypatch.setattr(media.time, "sleep", lambda s: None)
+    monkeypatch.setattr(media, "attempt_modes", lambda: ["direct"])
+    monkeypatch.setattr(media, "network_options", lambda mode: {})
+    calls = {"n": 0}
+
+    def flaky(net):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise subprocess.TimeoutExpired(["node", "generate_once.js", "--version"], 15)
+        return "ok"
+
+    assert media._attempts(flaky) == "ok" and calls["n"] == 3
+
+    def always(net):
+        raise subprocess.TimeoutExpired(["node"], 15)
+
+    with pytest.raises(media.MediaError, match="too busy"):
+        media._attempts(always)

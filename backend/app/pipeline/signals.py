@@ -8,25 +8,37 @@ from __future__ import annotations
 
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import numpy as np
+
+from . import media
 
 SILENCE_DB = -80.0
 
 
-def loudness_per_second(wav: Path) -> np.ndarray:
-    """RMS level in dB for each second of a 16-bit mono WAV, read in chunks."""
-    levels: list[float] = []
+def _level(samples: np.ndarray) -> float:
+    rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+    return 20 * np.log10(rms) if rms > 1e-4 else SILENCE_DB
+
+
+def _wav_seconds(wav: Path) -> Iterator[np.ndarray]:
     with wave.open(str(wav), "rb") as handle:
         rate = handle.getframerate()
-        while True:
-            raw = handle.readframes(rate)
-            if not raw:
-                break
-            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
-            levels.append(20 * np.log10(rms) if rms > 1e-4 else SILENCE_DB)
+        while raw := handle.readframes(rate):
+            yield np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def loudness_per_second(path: Path, on_progress: Callable[[int], None] | None = None) -> np.ndarray:
+    """RMS level in dB for each second of a sound or video file. A 16-bit WAV is read directly; any
+    other file is decoded as it is read (ten hours take about a minute), so nothing large is kept.
+    `on_progress` gets the number of seconds measured so far, every ten minutes of sound."""
+    seconds = _wav_seconds(path) if path.suffix.lower() == ".wav" else media.pcm_seconds(path)
+    levels: list[float] = []
+    for samples in seconds:
+        levels.append(_level(samples))
+        if on_progress and len(levels) % 600 == 0:
+            on_progress(len(levels))
     return np.array(levels, dtype=np.float32)
 
 
@@ -44,10 +56,11 @@ def _smooth(values: np.ndarray, width: int) -> np.ndarray:
     return np.convolve(values, np.ones(width) / width, mode="same")
 
 
-def analyze(wav: Path, words: list[dict[str, Any]],
+def analyze(levels: np.ndarray, words: list[dict[str, Any]],
             heatmap: list[dict[str, Any]] | None = None) -> np.ndarray:
-    """Interest score per second (higher = more likely a clip-worthy moment)."""
-    db = loudness_per_second(wav)
+    """Interest score per second (higher = more likely a clip-worthy moment), from the loudness per
+    second (`loudness_per_second`), the spoken words (none yet is fine) and YouTube's replay curve."""
+    db = np.asarray(levels, dtype=np.float32)
     n = db.size
     if n == 0:
         return db
@@ -58,14 +71,14 @@ def analyze(wav: Path, words: list[dict[str, Any]],
     before = np.concatenate([np.full(10, voiced[0]), voiced])[:n]
     jump = _robust_z(_smooth(voiced, 2) - _smooth(before, 10))
 
-    rate = np.zeros(n, dtype=np.float32)
-    for word in words:
-        second = int(word["s"])
-        if 0 <= second < n:
-            rate[second] += 1
-    pace = _robust_z(_smooth(rate, 5))
-
-    score = 0.5 * loud + 0.35 * jump + 0.3 * pace
+    score = 0.5 * loud + 0.35 * jump
+    if words:
+        rate = np.zeros(n, dtype=np.float32)
+        for word in words:
+            second = int(word["s"])
+            if 0 <= second < n:
+                rate[second] += 1
+        score = score + 0.3 * _robust_z(_smooth(rate, 5))
     if heatmap:
         heat = np.zeros(n, dtype=np.float32)
         for point in heatmap:
@@ -94,3 +107,18 @@ def candidates(score: np.ndarray, *, spacing: int, limit: int,
         picks.append({"peak": float(peak), "signal": round(float(score[peak]), 2)})
         remaining[max(peak - spacing, 0):peak + spacing + 1] = floor
     return sorted(picks, key=lambda p: p["peak"])
+
+
+def ranges_around(cands: list[dict[str, float]], *, before: float, after: float,
+                  total: float) -> list[tuple[float, float]]:
+    """The stretches `before` seconds ahead of and `after` seconds past each candidate peak, merged
+    where they touch, within [0, total]."""
+    spans = sorted((max(c["peak"] - before, 0.0), min(c["peak"] + after, total or c["peak"] + after))
+                   for c in cands)
+    merged: list[tuple[float, float]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [(round(s, 2), round(e, 2)) for s, e in merged if e > s]

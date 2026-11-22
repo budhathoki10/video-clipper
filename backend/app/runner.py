@@ -5,13 +5,14 @@ Every step writes its result to the job folder, so a job that is interrupted
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 
@@ -141,17 +142,28 @@ def store_outputs(job_id: str, out_dir: Path, result: dict[str, Any]) -> tuple[s
     return rel(video), rel(thumb)
 
 
-def fetch_source_again(clip: dict[str, Any], opts: dict[str, Any]) -> Path:
-    """Download the source video again for a clip whose copy was removed."""
-    if "/live/" in opts["source"] or not clip.get("source_url"):
-        raise RuntimeError("The recording of this moment was removed after clipping, so it "
-                           "cannot be re-rendered. Re-clip the video instead.")
-    folder = job_dir(clip["job_id"])
-    path = media.download(clip["source_url"], folder,
-                          max_height=int(opts["settings"]["format"]["source_quality"]))
-    opts["source"] = rel(path)
-    db.update("clips", clip["id"], options=opts)
-    return path
+SECTION_PAD = 3.0  # extra seconds fetched around a clip's part of a linked video
+
+
+@contextlib.contextmanager
+def clip_source(*, job_id: str, start: float, end: float, settings: dict[str, Any],
+                local: Path | None = None, url: str | None = None) -> Iterator[tuple[Path, float]]:
+    """The video a clip is rendered from, as (file, the second of the video the file starts at).
+    A local file (an upload or a live recording) is used as it is. For a link, only this clip's part
+    is downloaded now and removed afterwards: a long video is never downloaded whole."""
+    if local is not None:
+        yield local, 0.0
+        return
+    if not url:
+        raise RuntimeError("The video for this clip is no longer available. Add it again.")
+    begin = max(start - SECTION_PAD, 0.0)
+    path = job_dir(job_id) / "sections" / f"{db.new_id()}.mp4"
+    try:
+        yield media.download_section(url, path, begin, end + SECTION_PAD,
+                                     max_height=int(settings["format"]["source_quality"])), begin
+    finally:
+        for leftover in path.parent.glob(path.stem + ".*"):
+            leftover.unlink(missing_ok=True)
 
 
 def _in_context(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -249,10 +261,11 @@ def describe(sel: dict[str, Any], meta: dict[str, Any], settings: dict[str, Any]
     return "\n\n".join(line for line in lines if line.strip())
 
 
-def make_clip(*, job_id: str, clip_id: str, sel: dict[str, Any], source: Path,
+def make_clip(*, job_id: str, clip_id: str, sel: dict[str, Any], source: Path | None,
               words_file: Path, meta: dict[str, Any], settings: dict[str, Any],
-              trend_brief: str = "") -> None:
-    """Render one clip, then score it with the audience panel."""
+              trend_brief: str = "", url: str | None = None) -> None:
+    """Render one clip, then score it with the audience panel. `source` is a local video file; without
+    one, only this clip's part of the video at `url` is downloaded (see `clip_source`)."""
     existing = db.find_one("clips", {"id": clip_id})
     if existing and existing["status"] == "ready":
         return
@@ -265,7 +278,8 @@ def make_clip(*, job_id: str, clip_id: str, sel: dict[str, Any], source: Path,
             "hashtags": sel.get("hashtags") or [], "reason": sel.get("reason", ""),
             "ai_score": sel.get("score"), "source_title": meta.get("title"),
             "source_channel": meta.get("channel"), "source_url": meta.get("webpage_url"),
-            "options": {"settings": settings, "source": rel(source), "words": rel(words_file),
+            "options": {"settings": settings, "source": rel(source) if source is not None else None,
+                        "url": url if source is None else None, "words": rel(words_file),
                         "credit": credit_line(meta), "trend_brief": trend_brief,
                         "category": meta.get("category", "")},
             "created_at": time.time(),
@@ -273,10 +287,13 @@ def make_clip(*, job_id: str, clip_id: str, sel: dict[str, Any], source: Path,
     words = _load(words_file)["words"]
     out_dir = job_dir(job_id) / "clips"
     try:
-        result = render.render_clip(
-            source=source, out_dir=out_dir, clip_id=clip_id, start=sel["start"], end=sel["end"],
-            words=words, settings=settings, title=sel.get("hook") or "", credit=credit_line(meta),
-        )
+        with clip_source(job_id=job_id, start=sel["start"], end=sel["end"], settings=settings,
+                         local=source, url=url) as (path, offset):
+            result = render.render_clip(
+                source=path, out_dir=out_dir, clip_id=clip_id, start=sel["start"], end=sel["end"],
+                words=words, settings=settings, title=sel.get("hook") or "", credit=credit_line(meta),
+                offset=offset,
+            )
     except Exception as exc:
         db.update("clips", clip_id, status="failed", error=str(exc)[:500])
         return
@@ -284,6 +301,30 @@ def make_clip(*, job_id: str, clip_id: str, sel: dict[str, Any], source: Path,
     db.update("clips", clip_id, status="ready", error=None, file=file_ref, thumb=thumb_ref,
               width=result["width"], height=result["height"])
     score_clip(clip_id)
+
+
+def recognised_words(clip: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The words speech recognition heard in the clip's video (all of its transcript), or None when the
+    transcript is gone."""
+    restore_job_files(clip["job_id"])
+    name = (clip.get("options") or {}).get("words")
+    path = config.DATA / name if name else None
+    if path is None or not path.exists():
+        return None
+    return (_load(path) or {}).get("words", [])
+
+
+def clip_words(clip: dict[str, Any]) -> list[dict[str, Any]]:
+    """The words captioned in a clip: the transcript, with the person's own corrections
+    (`caption_words`) in place of the stretch they edited (`caption_range`). Words outside it, for
+    example after the clip was trimmed longer, come from the transcript."""
+    words = recognised_words(clip) or []
+    edited = clip.get("caption_words")
+    if edited is None:
+        return words
+    lo, hi = clip.get("caption_range") or (clip["start"], clip["end"])
+    kept = [w for w in words if w["e"] <= lo or w["s"] >= hi]
+    return sorted(kept + edited, key=lambda w: w["s"])
 
 
 def score_clip(clip_id: str) -> None:
@@ -294,8 +335,7 @@ def score_clip(clip_id: str) -> None:
     size = int(opts["settings"]["ai"].get("panel_size", 0))
     if size <= 0:
         return
-    restore_job_files(clip["job_id"])
-    words = _load(config.DATA / opts["words"])["words"]
+    words = clip_words(clip)
     spoken = " ".join(w["w"] for w in words if clip["start"] <= w["s"] <= clip["end"])
     result = panel.run_panel(
         title=clip["title"], hook=clip["hook"] or "", transcript=spoken,
@@ -304,6 +344,53 @@ def score_clip(clip_id: str) -> None:
     )
     if result:
         db.update("clips", clip_id, panel=result, panel_score=result["score"])
+
+
+AUTO_CLIPS = 30  # "as many as found" (max_clips 0) still stops here, so one video cannot flood the list
+AUTO_MIN_SCORE = 60  # and keeps only clips the AI scores at least this high
+FULL_TRANSCRIPT_SEC = 2 * 3600  # longer videos: only the stretches around the strongest moments are transcribed
+SPEECH_BEFORE, SPEECH_AFTER = 150.0, 105.0  # each stretch reaches this far before and after its moment
+
+
+def clip_settings(clip: dict[str, Any]) -> dict[str, Any]:
+    """The clip settings a job runs with. `max_clips` 0 means as many as are found: then up to
+    AUTO_CLIPS clips are made, each scoring at least AUTO_MIN_SCORE."""
+    if int(clip.get("max_clips") or 0) > 0:
+        return clip
+    return {**clip, "max_clips": AUTO_CLIPS, "min_score": max(float(clip.get("min_score") or 0), AUTO_MIN_SCORE)}
+
+
+def _local_source(folder: Path) -> Path | None:
+    """The video file in a job folder (an upload), if it is complete."""
+    found = [p for p in folder.glob("source.*") if p.suffix.lower() in SOURCE_SUFFIXES]
+    return found[0] if found and (folder / "download.done").exists() else None
+
+
+def _download_sound(job_id: str, folder: Path, url: str) -> Path:
+    """Only the sound of a linked video, kept until its moments are chosen."""
+    found = [p for p in folder.glob("audio.*") if p.suffix.lower() not in media.NOT_MEDIA]
+    if found and (folder / "audio.done").exists():
+        return found[0]
+    set_step(job_id, "Downloading the sound", 0.03)
+    require_disk()
+    sound = media.download_audio(
+        url, folder,
+        on_progress=cancel_aware(job_id, lambda p: set_step(job_id, "Downloading the sound", 0.03 + 0.12 * p)))
+    (folder / "audio.done").write_text("ok")
+    return sound
+
+
+def _speech_ranges(loudness: np.ndarray, meta: dict[str, Any],
+                   clip_cfg: dict[str, Any]) -> list[tuple[float, float]] | None:
+    """What to transcribe: None (all of it) for a video up to FULL_TRANSCRIPT_SEC. A longer one, say an
+    eleven-hour stream, is first ranked from its loudness and YouTube's replay curve; only the
+    stretches around its strongest moments are transcribed, which takes minutes instead of hours."""
+    if loudness.size <= FULL_TRANSCRIPT_SEC:
+        return None
+    rough = signals.analyze(loudness, [], meta.get("heatmap"))
+    cands = signals.candidates(rough, spacing=int(SPEECH_AFTER),
+                               limit=min(max(int(clip_cfg["max_clips"]) * 4, 16), 40))
+    return signals.ranges_around(cands, before=SPEECH_BEFORE, after=SPEECH_AFTER, total=float(loudness.size))
 
 
 def process_video(job: dict[str, Any]) -> None:
@@ -326,50 +413,59 @@ def process_video(job: dict[str, Any]) -> None:
               duration=meta["duration"], thumbnail=meta["thumbnail"])
     check(job_id)
 
-    found = [p for p in folder.glob("source.*") if p.suffix.lower() in SOURCE_SUFFIXES]
-    if found and (folder / "download.done").exists():
-        source = found[0]
-    elif not job.get("url"):  # an uploaded file that is no longer here cannot be fetched again
+    url = meta.get("webpage_url") or job.get("url")
+    # An upload is already here. A link is never downloaded whole: its sound is enough to find the
+    # moments, and each clip's part of the picture is fetched when that clip is rendered.
+    local = _local_source(folder) if not job.get("url") else None
+    if not job.get("url") and local is None:
         raise RuntimeError("The uploaded file is no longer on the server. Upload it again.")
-    else:
-        set_step(job_id, "Downloading video", 0.03)
-        require_disk()
-        source = media.download(
-            job["url"], folder, max_height=int(fmt["source_quality"]), max_minutes=max_minutes,
-            on_progress=cancel_aware(job_id, lambda p: set_step(job_id, "Downloading video", 0.03 + 0.27 * p)),
-        )
-        (folder / "download.done").write_text("ok")
-    check(job_id)
-
-    wav = folder / "audio.wav"
-    transcript = _load(folder / "transcript.json")
-    if not transcript:
-        set_step(job_id, "Preparing audio", 0.31)
-        media.extract_audio(source, wav)
-        duration = media.audio_duration(wav)
-        last = [0.0]
-
-        def on_progress(p: float) -> None:
-            if p - last[0] >= 0.03:
-                last[0] = p
-                set_step(job_id, "Transcribing speech", 0.33 + 0.27 * p)
-
-        set_step(job_id, "Transcribing speech", 0.33)
-        transcript = transcribe.transcribe(
-            wav, model_name=ai["whisper_model"], language=settings["captions"]["language"],
-            duration=duration, on_progress=on_progress,
-        )
-        _save(folder / "transcript.json", transcript)
-    check(job_id)
+    clip_cfg = clip_settings(settings["clip"])
 
     picks = _load(folder / "selection.json")
     if picks is None:
+        transcript = _load(folder / "transcript.json")
+        sound = local
+        if local is None and (not (folder / "levels.json").exists() or transcript is None):
+            sound = _download_sound(job_id, folder, job["url"])
+        check(job_id)
+
+        levels = _load(folder / "levels.json")
+        if levels is None:
+            seconds = float(meta.get("duration") or 0) or 1.0
+            step = "Listening to the whole video"
+            set_step(job_id, step, 0.16)
+            measured = signals.loudness_per_second(
+                sound, on_progress=cancel_aware(job_id, lambda n: set_step(job_id, step, 0.16 + 0.09 * min(n / seconds, 1.0)), every=0))
+            if max_minutes:
+                measured = measured[:int(max_minutes * 60)]
+            levels = [round(float(v), 1) for v in measured]
+            _save(folder / "levels.json", levels)
+        loudness = np.array(levels, dtype=np.float32)
+        check(job_id)
+
+        if transcript is None:
+            ranges = _speech_ranges(loudness, meta, clip_cfg)
+            last = [0.0]
+
+            def on_progress(p: float) -> None:
+                if p - last[0] >= 0.03:
+                    last[0] = p
+                    check(job_id)
+                    set_step(job_id, "Transcribing speech", 0.26 + 0.34 * p)
+
+            set_step(job_id, "Transcribing speech" if ranges is None else
+                     "Transcribing the strongest parts", 0.26)
+            transcript = transcribe.transcribe(
+                sound, model_name=ai["whisper_model"], language=settings["captions"]["language"],
+                duration=float(loudness.size), ranges=ranges, levels=loudness, on_progress=on_progress,
+            )
+            transcript["ranges"] = ranges  # None: the whole video was transcribed
+            _save(folder / "transcript.json", transcript)
+        check(job_id)
+
         set_step(job_id, "Finding the strongest moments", 0.62)
-        if not wav.exists():
-            media.extract_audio(source, wav)
-        score = signals.analyze(wav, transcript["words"], meta.get("heatmap"))
+        score = signals.analyze(loudness, transcript["words"], meta.get("heatmap"))
         _save(folder / "signals.json", [round(float(v), 2) for v in np.nan_to_num(score)])
-        clip_cfg = settings["clip"]
         cands = signals.candidates(
             score, spacing=int(clip_cfg["max_sec"]),
             limit=min(max(int(clip_cfg["max_clips"]) * 3, 6), 24),
@@ -388,15 +484,16 @@ def process_video(job: dict[str, Any]) -> None:
             pick["id"] = db.new_id()
         _save(folder / "selection.json", picks)
         if warning:
-            db.update("jobs", job_id, payload={"warning": warning})
-    wav.unlink(missing_ok=True)
+            db.update("jobs", job_id, payload={**(job.get("payload") or {}), "warning": warning})
+    for sound_file in folder.glob("audio.*"):  # the sound is not needed once the moments are chosen
+        sound_file.unlink(missing_ok=True)
     check(job_id)
 
     total = max(len(picks), 1)
     done = [0]
 
     def work(pick: dict[str, Any]) -> None:
-        make_clip(job_id=job_id, clip_id=pick["id"], sel=pick, source=source,
+        make_clip(job_id=job_id, clip_id=pick["id"], sel=pick, source=local, url=url,
                   words_file=folder / "transcript.json", meta=meta, settings=settings,
                   trend_brief=_load(folder / "trends.json") or "")
         done[0] += 1
@@ -412,7 +509,7 @@ def process_video(job: dict[str, Any]) -> None:
         set_step(job_id, f"{len(picks)} {'clip' if len(picks) == 1 else 'clips'} ready", 1.0)
     if storage.enabled() and storage.cfg().get("delete_source") and picks:
         if db.count("clips", {"job_id": job_id, "status": "ready"}):  # only once its clips exist
-            persist_job_files(job_id, folder, source)
+            persist_job_files(job_id, folder, local)
 
 
 def process_more(job: dict[str, Any]) -> None:
@@ -451,14 +548,12 @@ def process_more(job: dict[str, Any]) -> None:
         set_step(job["id"], "No other strong moments were found", 1.0)
         return
 
-    source = restore_job_files(source_id, source=True)  # a local copy, or the one kept in storage
-    if source is None:
-        set_step(job["id"], "Downloading the video again", 0.25)
-        require_disk()
-        source = media.download(
-            meta.get("webpage_url") or source_job["url"], folder,
-            max_height=int(settings["format"]["source_quality"]), max_minutes=settings.get("max_minutes"),
-            on_progress=cancel_aware(job["id"], lambda p: set_step(job["id"], "Downloading the video again", 0.25 + 0.3 * p)))
+    # An upload's file is kept (here or in storage); a link has none, and each clip fetches its part.
+    source = restore_job_files(source_id, source=True)
+    url = meta.get("webpage_url") or source_job.get("url")
+    if source is None and not url:
+        raise RuntimeError("The uploaded file is no longer available, so more clips cannot be made from it. "
+                           "Upload it again.")
     check(job["id"])
 
     picks = [add_context(pick, duration=float(meta.get("duration") or 0), settings=settings) for pick in picks]
@@ -470,7 +565,7 @@ def process_more(job: dict[str, Any]) -> None:
     done = [0]
 
     def work(pick: dict[str, Any]) -> None:
-        make_clip(job_id=source_id, clip_id=pick["id"], sel=pick, source=source,
+        make_clip(job_id=source_id, clip_id=pick["id"], sel=pick, source=source, url=url,
                   words_file=folder / "transcript.json", meta=meta, settings=settings,
                   trend_brief=trend_brief if isinstance(trend_brief, str) else "")
         done[0] += 1
@@ -488,6 +583,20 @@ def process_more(job: dict[str, Any]) -> None:
             persist_job_files(source_id, folder, source)
 
 
+def _rerender_input(clip: dict[str, Any], opts: dict[str, Any]) -> tuple[Path | None, str | None]:
+    """What to render an edited clip from: (local file, None) or (None, link to fetch its part from)."""
+    if opts.get("url"):
+        return None, opts["url"]
+    saved = opts.get("source") or ""
+    source = restore_job_files(clip["job_id"], source=True) or (config.DATA / saved if saved else None)
+    if source is not None and source.exists():
+        return source, None
+    if "/live/" in saved or not clip.get("source_url"):
+        raise RuntimeError("The recording of this moment was removed after clipping, so it "
+                           "cannot be re-rendered. Re-clip the video instead.")
+    return None, clip["source_url"]  # made before parts were fetched per clip: fetch its part now
+
+
 def rerender(job: dict[str, Any]) -> None:
     """Render an edited clip again (new trim, title or format)."""
     clip_id = job["payload"]["clip_id"]
@@ -496,19 +605,19 @@ def rerender(job: dict[str, Any]) -> None:
         raise RuntimeError("That clip no longer exists.")
     opts = clip["options"]
     restore_job_files(clip["job_id"])
-    source = restore_job_files(clip["job_id"], source=True) or config.DATA / opts["source"]
-    if not source.exists():
-        source = fetch_source_again(clip, opts)
+    source, url = _rerender_input(clip, opts)
     set_step(job["id"], "Rendering clip", 0.2)
     db.update("clips", clip_id, status="rendering")
-    words = _load(config.DATA / opts["words"])["words"]
+    words = clip_words(clip)
     out_dir = job_dir(clip["job_id"]) / "clips"
     try:
-        result = render.render_clip(
-            source=source, out_dir=out_dir, clip_id=clip_id, start=clip["start"], end=clip["end"],
-            words=words, settings=opts["settings"], title=clip["hook"] or "",
-            credit=opts.get("credit", ""),
-        )
+        with clip_source(job_id=clip["job_id"], start=clip["start"], end=clip["end"], settings=opts["settings"],
+                         local=source, url=url) as (path, offset):
+            result = render.render_clip(
+                source=path, out_dir=out_dir, clip_id=clip_id, start=clip["start"], end=clip["end"],
+                words=words, settings=opts["settings"], title=clip["hook"] or "",
+                credit=opts.get("credit", ""), offset=offset,
+            )
     except Exception as exc:
         db.update("clips", clip_id, status="failed", error=str(exc)[:500])
         raise

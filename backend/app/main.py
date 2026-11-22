@@ -7,7 +7,6 @@ settings, AI keys and YouTube channel. There is no administrator and nobody can 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -27,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, config, db, keys, llm, runner, storage, worker, youtube
-from .pipeline import media, selection, trends
+from .pipeline import captions, media, selection, trends
 
 ACTIVE = ("queued", "running", "stopping")
 MAX_ACTIVE_JOBS = 3  # videos one person may have in progress at once; there is no limit on their length
@@ -220,6 +219,8 @@ def clip_out(clip: dict[str, Any]) -> dict[str, Any]:
     clip.pop("file", None)  # internal storage references are never sent to the browser
     clip.pop("thumb", None)
     clip.pop("user_id", None)
+    clip["captions_edited"] = clip.pop("caption_words", None) is not None
+    clip.pop("caption_range", None)
     clip["duration"] = _clip_duration(clip)
     return clip
 
@@ -431,10 +432,19 @@ def _job_options(request: Request, sent: dict[str, Any]) -> dict[str, Any]:
     if isinstance(sent.get("max_minutes"), (int, float)) and sent["max_minutes"] > 0:
         allowed["max_minutes"] = sent["max_minutes"]
     options = config.deep_merge(db.settings_for(_uid(request)), allowed)
-    clip = options["clip"]
+    _check_clip(options["clip"])
+    return options
+
+
+MAX_CLIPS = 20  # the most clips someone can ask for; 0 asks for as many as are found
+
+
+def _check_clip(clip: dict[str, Any]) -> None:
     if clip["min_sec"] > clip["max_sec"]:
         raise fail(422, "Minimum clip length cannot be longer than the maximum.")
-    return options
+    count = clip.get("max_clips")
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= MAX_CLIPS:
+        raise fail(422, f"Clips to make must be a whole number from 1 to {MAX_CLIPS}, or 0 for as many as are found.")
 
 
 def _require_storage() -> None:
@@ -708,13 +718,86 @@ def patch_clip(clip_id: str, body: ClipPatch, request: Request) -> dict[str, Any
                    for k in ("format", "captions", "overlay") if isinstance(body.settings.get(k), dict)}
         opts["settings"] = config.deep_merge(opts["settings"], allowed)
         values["options"] = opts
+    if body.rerender and clip["status"] == "rendering":
+        raise fail(409, "This clip is already rendering.")
     db.update("clips", clip_id, **values)
     if body.rerender:
-        if clip["status"] == "rendering":
-            raise fail(409, "This clip is already rendering.")
-        db.update("clips", clip_id, status="rendering", created_at=time.time())
-        queue_job("render", payload={"clip_id": clip_id, "rescore": body.rescore},
-                  title=values.get("title") or clip["title"], user_id=_uid(request))
+        _queue_render(clip, request, rescore=body.rescore, title=values.get("title"))
+    return get_clip(clip_id, request)
+
+
+def _queue_render(clip: dict[str, Any], request: Request, *, rescore: bool, title: str | None = None) -> None:
+    db.update("clips", clip["id"], status="rendering", created_at=time.time())
+    queue_job("render", payload={"clip_id": clip["id"], "rescore": rescore},
+              title=title or clip["title"], user_id=_uid(request))
+
+
+class CaptionLine(BaseModel):
+    s: float = Field(ge=0)
+    e: float = Field(ge=0)
+    text: str = Field(max_length=captions.MAX_LINE_CHARS)
+
+
+class CaptionEdit(BaseModel):
+    lines: list[CaptionLine] = Field(max_length=1000)
+
+
+def _editable_captions(clip: dict[str, Any]) -> list[dict[str, Any]]:
+    """The words the caption editor starts from, or a 409 saying why this clip's captions cannot change."""
+    if "/live/" in ((clip.get("options") or {}).get("source") or ""):
+        raise fail(409, "This clip was cut from a live stream and its recording was removed, so it cannot be "
+                        "rendered again with new captions.")
+    try:
+        words = runner.recognised_words(clip)
+    except storage.StorageError:
+        raise fail(503, "The words of this clip could not be loaded right now. Try again in a minute.") from None
+    if words is None and clip.get("caption_words") is None:
+        raise fail(409, "The words of this clip are no longer available, so its captions cannot be edited.")
+    return words or []
+
+
+@app.get("/api/clips/{clip_id}/captions")
+def get_captions(clip_id: str, request: Request) -> dict[str, Any]:
+    """The clip's caption lines as shown on screen, with times in seconds from the clip's start."""
+    clip = _clip_for(request, clip_id)
+    _editable_captions(clip)
+    start, end = clip["start"], clip["end"]
+    words = [{**w, "s": max(w["s"] - start, 0.0), "e": min(w["e"], end) - start}
+             for w in runner.clip_words(clip) if w["e"] > start and w["s"] < end]
+    per_line = ((clip["options"].get("settings") or {}).get("captions") or {}).get("words_per_line", 3)
+    return {"lines": captions.lines_for(words, per_line), "duration": _clip_duration(clip),
+            "edited": clip.get("caption_words") is not None}
+
+
+@app.put("/api/clips/{clip_id}/captions")
+def put_captions(clip_id: str, body: CaptionEdit, request: Request) -> dict[str, Any]:
+    """Save corrected caption lines (times in seconds from the clip's start) and render the clip again."""
+    clip = _clip_for(request, clip_id)
+    if clip["status"] == "rendering":
+        raise fail(409, "This clip is already rendering. Save your captions when it is ready.")
+    recognised = _editable_captions(clip)
+    start, end = clip["start"], clip["end"]
+    lines = []
+    for line in body.lines:
+        if line.e <= line.s or line.e > end - start + 0.5:
+            raise fail(422, "A caption line has times outside the clip. Reload the captions and try again.")
+        lines.append({"s": start + line.s, "e": start + line.e, "text": " ".join(line.text.split())})
+    in_clip = [w for w in recognised if w["e"] > start and w["s"] < end]
+    db.update("clips", clip_id, caption_words=captions.words_from_lines(lines, in_clip),
+              caption_range=[start, end])
+    _queue_render(clip, request, rescore=False)
+    return get_clip(clip_id, request)
+
+
+@app.delete("/api/clips/{clip_id}/captions")
+def reset_captions(clip_id: str, request: Request) -> dict[str, Any]:
+    """Go back to the words speech recognition heard, and render the clip again."""
+    clip = _clip_for(request, clip_id)
+    if clip["status"] == "rendering":
+        raise fail(409, "This clip is already rendering. Try again when it is ready.")
+    _editable_captions(clip)
+    db.update("clips", clip_id, caption_words=None, caption_range=None)
+    _queue_render(clip, request, rescore=False)
     return get_clip(clip_id, request)
 
 
@@ -723,15 +806,11 @@ def suggest_clip_hooks(clip_id: str, request: Request) -> dict[str, list[str]]:
     """Alternative on-screen hooks for a clip, written from what is said in it."""
     clip = _clip_for(request, clip_id)
     opts = clip["options"] or {}
-    spoken = ""
-    try:
-        runner.restore_job_files(clip["job_id"])
+    try:  # the corrected captions when there are any
+        words = runner.clip_words(clip)
     except storage.StorageError:
-        pass  # without the transcript the hooks are written from the title alone
-    transcript = config.DATA / opts.get("words", "")
-    if opts.get("words") and transcript.exists():
-        words = json.loads(transcript.read_text(encoding="utf-8")).get("words", [])
-        spoken = " ".join(w["w"] for w in words if clip["start"] <= w["s"] <= clip["end"])
+        words = []  # without the transcript the hooks are written from the title alone
+    spoken = " ".join(w["w"] for w in words if clip["start"] <= w["s"] <= clip["end"])
     try:
         with llm.as_user(_uid(request)):
             hooks = selection.suggest_hooks(title=clip["title"] or "", spoken=spoken,
@@ -816,8 +895,7 @@ def put_settings(patch: dict[str, Any], request: Request) -> dict[str, Any]:
     merged = config.deep_merge(db.settings_for(_uid(request)), allowed)
     if merged["ai"]["provider"] not in config.PROVIDER_SECRET:
         raise fail(422, "Unknown AI provider.")
-    if merged["clip"]["min_sec"] > merged["clip"]["max_sec"]:
-        raise fail(422, "Minimum clip length cannot be longer than the maximum.")
+    _check_clip(merged["clip"])
     if merged["clip"]["min_sec"] < 5 or merged["clip"]["max_sec"] > 180:
         raise fail(422, "Clip length must be between 5 seconds and 3 minutes.")
     db.save_prefs(_uid(request), allowed)

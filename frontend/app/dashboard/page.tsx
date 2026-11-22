@@ -5,13 +5,16 @@ import Link from "next/link";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
+import { ClipCountSelect, clipCountLabel } from "@/components/clip-count";
+import { LayoutPicker } from "@/components/layout-options";
 import { JobRow } from "@/components/job-row";
 import { Pagination } from "@/components/pagination";
 import { Button, EmptyState, ErrorState, Field, Notice, SkeletonRows, cx, useToast } from "@/components/ui";
 import { api, useApi, type ClipSummary, type Job, type Page, type Settings, type SecretStatus, type SystemStatus } from "@/lib/api";
+import { withoutHidden } from "@/lib/optimistic";
 import { usePagedApi } from "@/lib/pagination";
 
-type Overrides = { max_clips: number; min_sec: number; max_sec: number; aspect: Settings["format"]["aspect"]; quality: number };
+type Overrides = { max_clips: number; min_sec: number; max_sec: number; aspect: Settings["format"]["aspect"]; quality: number; layout: Settings["format"]["layout"] };
 
 export default function HomePage() {
   const toast = useToast();
@@ -33,7 +36,7 @@ export default function HomePage() {
   useEffect(() => {
     const s = settings.data?.settings;
     if (s && !overrides) {
-      setOverrides({ max_clips: s.clip.max_clips, min_sec: s.clip.min_sec, max_sec: s.clip.max_sec, aspect: s.format.aspect, quality: s.format.quality });
+      setOverrides({ max_clips: s.clip.max_clips, min_sec: s.clip.min_sec, max_sec: s.clip.max_sec, aspect: s.format.aspect, quality: s.format.quality, layout: s.format.layout });
     }
   }, [settings.data, overrides]);
 
@@ -51,7 +54,7 @@ export default function HomePage() {
 
   function jobOptions() {
     return overrides
-      ? { clip: { max_clips: overrides.max_clips, min_sec: overrides.min_sec, max_sec: overrides.max_sec }, format: { aspect: overrides.aspect, quality: overrides.quality } }
+      ? { clip: { max_clips: overrides.max_clips, min_sec: overrides.min_sec, max_sec: overrides.max_sec }, format: { aspect: overrides.aspect, quality: overrides.quality, layout: overrides.layout } }
       : {};
   }
 
@@ -109,8 +112,8 @@ export default function HomePage() {
     }
   }
 
-  const visibleJobs = jobs.data?.items ?? [];
-  const topClips = clips.data?.items ?? [];
+  const visibleJobs = withoutHidden(jobs.data?.items ?? []);
+  const topClips = withoutHidden(clips.data?.items ?? []);
   const set = <K extends keyof Overrides>(key: K, value: Overrides[K]) => setOverrides((o) => (o ? { ...o, [key]: value } : o));
 
   return (
@@ -207,14 +210,14 @@ export default function HomePage() {
             Options for this video
             {overrides && !showOptions && (
               <span className="hidden text-ink-3 sm:inline">
-                · up to {overrides.max_clips} clips · {overrides.min_sec}–{overrides.max_sec} s · {overrides.aspect} · {overrides.quality}p
+                · {clipCountLabel(overrides.max_clips)} · {overrides.min_sec}–{overrides.max_sec} s · {overrides.aspect} · {overrides.quality}p
               </span>
             )}
           </button>
           {showOptions && overrides && (
             <div id="job-options" className="animate-enter mt-3 grid grid-cols-2 gap-3 border-t border-line-subtle pt-3 md:grid-cols-5">
               <Field label="Clips to make">
-                {(p) => <input {...p} type="number" min={1} max={20} className="field num" value={overrides.max_clips} onChange={(e) => set("max_clips", Number(e.target.value) || 1)} />}
+                {(p) => <ClipCountSelect {...p} value={overrides.max_clips} onChange={(count) => set("max_clips", count)} />}
               </Field>
               <Field label="Shortest (seconds)">
                 {(p) => <input {...p} type="number" min={5} max={180} className="field num" value={overrides.min_sec} onChange={(e) => set("min_sec", Number(e.target.value) || 5)} />}
@@ -241,6 +244,10 @@ export default function HomePage() {
                   </select>
                 )}
               </Field>
+              <div className="col-span-2 flex flex-col gap-1.5 md:col-span-5">
+                <span className="text-xs font-medium text-ink-2">Video style</span>
+                <LayoutPicker value={overrides.layout} onChange={(layout) => set("layout", layout)} link={url} />
+              </div>
             </div>
           )}
         </form>

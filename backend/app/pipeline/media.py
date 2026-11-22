@@ -7,15 +7,19 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+import numpy as np
 import yt_dlp
 from yt_dlp.utils import DownloadError, download_range_func
 
 from .. import config
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+PCM_RATE = 16000  # sound is analysed and transcribed as 16 kHz mono
+NOT_MEDIA = (".part", ".ytdl", ".temp", ".done")  # leftovers and markers beside a downloaded file
 
 
 class MediaError(RuntimeError):
@@ -156,11 +160,30 @@ def _attempts(action: Callable[[dict[str, Any]], Any]) -> Any:
     modes = attempt_modes()
     for index, mode in enumerate(modes):
         try:
-            return action(network_options(mode))
+            return _patiently(lambda: action(network_options(mode)))
         except MediaError as exc:
             if index == len(modes) - 1 or not getattr(exc, "retry_other_mode", False):
                 raise
             print(f"YouTube refused the '{mode}' way ({str(exc)[:80]}); trying '{modes[index + 1]}'.", flush=True)
+
+
+BUSY_RETRIES = 3  # tries when a helper program (the YouTube token maker) is too slow on a busy server
+BUSY_WAIT_SEC = 8
+
+
+def _patiently(action: Callable[[], Any]) -> Any:
+    """Run `action`, trying again when a helper process it starts times out. yt-dlp's token helper
+    (node) must answer within 15 s; a busy server (a live watch, a render) can miss that once, and the
+    next try usually succeeds. That timeout is not a yt-dlp error, so it would otherwise end the job."""
+    for attempt in range(1, BUSY_RETRIES + 1):
+        try:
+            return action()
+        except subprocess.TimeoutExpired:
+            if attempt == BUSY_RETRIES:
+                raise MediaError("The server was too busy to start the download. Try again in a minute, "
+                                 "or after a running live watch has finished.") from None
+            print(f"A download helper timed out (server busy); trying again, {attempt}/{BUSY_RETRIES - 1}.", flush=True)
+            time.sleep(BUSY_WAIT_SEC)
 
 
 def describe_formats(info: dict[str, Any]) -> str:
@@ -228,44 +251,112 @@ def fetch_info(url: str, *, max_height: int = 1080, net: dict[str, Any] | None =
     }
 
 
-def download(url: str, dest_dir: Path, *, max_height: int = 1080,
-             max_minutes: float | None = None,
-             on_progress: Callable[[float], None] | None = None,
-             net: dict[str, Any] | None = None) -> Path:
-    if net is None:
-        return _attempts(lambda options: download(url, dest_dir, max_height=max_height,
-                                                  max_minutes=max_minutes, on_progress=on_progress, net=options))
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
+def _progress_hook(on_progress: Callable[[float], None] | None) -> Callable[[dict], None]:
     def hook(status: dict) -> None:
         if on_progress and status.get("status") == "downloading":
             total = status.get("total_bytes") or status.get("total_bytes_estimate")
             if total:
                 on_progress(min(status.get("downloaded_bytes", 0) / total, 1.0))
+    return hook
 
+
+def download_audio(url: str, dest_dir: Path, *,
+                   on_progress: Callable[[float], None] | None = None,
+                   net: dict[str, Any] | None = None) -> Path:
+    """Only the sound of a video, in its smallest form (about 220 MB for 10 hours, against 17 GB for
+    the 1080p video). Clips are found from the sound; the picture is fetched per clip later
+    (`download_section`). Falls back to a combined file when no audio-only form is offered."""
+    if net is None:
+        return _attempts(lambda options: download_audio(url, dest_dir,
+                                                        on_progress=on_progress, net=options))
+    dest_dir.mkdir(parents=True, exist_ok=True)
     opts: dict[str, Any] = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
-        "format": "bv*+ba/b",
-        "format_sort": [f"res:{max_height}", "vcodec:h264", "acodec:m4a"],
-        "merge_output_format": "mp4",
-        "outtmpl": str(dest_dir / "source.%(ext)s"),
-        "progress_hooks": [hook],
-        "retries": 5, "fragment_retries": 5, "concurrent_fragment_downloads": 4,
+        "format": "ba[abr<=72]/ba/b",
+        "format_sort": ["+abr"],  # the smallest audio is plenty for finding moments and transcribing
+        "outtmpl": str(dest_dir / "audio.%(ext)s"),
+        "progress_hooks": [_progress_hook(on_progress)],
+        # YouTube slows down one long read; asking in 10 MB pieces keeps it at full speed.
+        "http_chunk_size": 10 * 1024 * 1024,
+        "retries": 5, "fragment_retries": 5,
         **net,
     }
-    if max_minutes:
-        opts["download_ranges"] = download_range_func(None, [(0, max_minutes * 60)])
-        opts["force_keyframes_at_cuts"] = False
+    # Always the whole track (about 25 MB an hour); a job's time limit is applied after measuring.
+    # Asking for a time range would fetch it through ffmpeg, which YouTube throttles (2 MB took 3 minutes).
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except DownloadError as exc:
         raise _error(exc) from None
-    files = sorted(dest_dir.glob("source.*"), key=lambda p: p.stat().st_size, reverse=True)
-    files = [f for f in files if f.suffix.lower() in (".mp4", ".mkv", ".webm")]
+    files = [f for f in dest_dir.glob("audio.*") if f.suffix.lower() not in NOT_MEDIA]
     if not files:
-        raise MediaError("The download finished but no video file was produced.")
-    return files[0]
+        raise MediaError("The download finished but no audio was produced.")
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def download_section(url: str, dest: Path, start: float, end: float, *, max_height: int = 1080,
+                     net: dict[str, Any] | None = None) -> Path:
+    """Only `[start, end]` seconds of a video, as `dest` (an .mp4). YouTube serves byte ranges, so a
+    minute of a ten-hour video takes seconds, not the whole file. The section starts at `start`."""
+    if net is None:
+        return _attempts(lambda options: download_section(url, dest, start, end, max_height=max_height, net=options))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    stem = dest.with_suffix("")
+    opts: dict[str, Any] = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": "bv*+ba/b",
+        "format_sort": [f"res:{max_height}", "vcodec:h264", "acodec:m4a"],
+        "merge_output_format": "mp4",
+        "outtmpl": str(stem) + ".%(ext)s",
+        "download_ranges": download_range_func(None, [(max(start, 0.0), end)]),
+        "force_keyframes_at_cuts": False,
+        "retries": 5, "fragment_retries": 5,
+        **net,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except DownloadError as exc:
+        raise _error(exc) from None
+    made = [p for p in dest.parent.glob(stem.name + ".*") if p.suffix.lower() in (".mp4", ".mkv", ".webm")]
+    if not made:
+        raise MediaError("This part of the video could not be downloaded. Try again in a few minutes.")
+    found = max(made, key=lambda p: p.stat().st_size)
+    if found != dest:
+        found.replace(dest)
+    return dest
+
+
+def read_pcm(path: Path, start: float = 0.0, length: float | None = None) -> np.ndarray:
+    """`length` seconds of sound from `start`, as 16 kHz mono float samples (any audio or video file)."""
+    cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(start, 0.0):.3f}"]
+    if length is not None:
+        cmd += ["-t", f"{length:.3f}"]
+    cmd += ["-i", str(path), "-vn", "-ac", "1", "-ar", str(PCM_RATE), "-f", "s16le", "-"]
+    proc = subprocess.run(cmd, capture_output=True, timeout=1800, creationflags=NO_WINDOW)
+    if proc.returncode != 0:
+        raise MediaError(f"The sound could not be read: {proc.stderr.decode(errors='replace')[-300:]}")
+    return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def pcm_seconds(path: Path) -> Iterator[np.ndarray]:
+    """The sound of a whole file, one second (16 kHz mono float samples) at a time, decoded as it is
+    read so a ten-hour file never sits in memory or on disk as raw audio."""
+    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(PCM_RATE),
+                             "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    assert proc.stdout is not None
+    try:
+        while True:
+            raw = proc.stdout.read(PCM_RATE * 2)
+            if not raw:
+                break
+            yield np.frombuffer(raw[:len(raw) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768.0
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
 
 
 def extract_audio(src: Path, wav: Path) -> Path:

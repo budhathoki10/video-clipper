@@ -74,6 +74,8 @@ class LiveSession:
         self.pending: dict[str, Any] | None = None
         self.pending_peak: dict[str, Any] | None = None
         self.clips = 0
+        # How many clips to make before stopping on its own; 0 = as many as the stream gives.
+        self.cap = max(int(self.settings["clip"].get("max_clips") or 0), 0)
         self.windows = 0
         self.meta: dict[str, Any] = {}
         self.trend_brief = ""
@@ -102,7 +104,13 @@ class LiveSession:
         return entry
 
     # -- clipping ------------------------------------------------------------
+    def full(self) -> bool:
+        """Whether the chosen number of clips has been made."""
+        return bool(self.cap) and self.clips >= self.cap
+
     def _build_window(self, entries: list[dict[str, Any]], peak: dict[str, Any]) -> None:
+        if self.full():  # a moment queued while the last allowed clip was rendering
+            return
         self.windows += 1
         self.win_dir.mkdir(exist_ok=True)
         base = self.win_dir / f"window_{self.windows:04d}"
@@ -215,11 +223,12 @@ class LiveSession:
         self.trend_brief = trends.brief_for(self.meta)
         recorder = _start_recorder(info["stream_urls"], self.seg_dir, seconds, 0)
         runner.set_step(self.job_id, "Watching live · waiting for the first segment")
-        next_index, restarts, stopping = 0, 0, False
+        next_index, restarts, stopping, reached = 0, 0, False, False
         try:
             while True:
                 row = db.find_one("jobs", {"id": self.job_id})
-                stopping = not row or row["status"] in ("stopping", "cancelled")
+                reached = reached or self.full()
+                stopping = not row or row["status"] in ("stopping", "cancelled") or reached
                 if stopping and recorder.poll() is None:
                     recorder.terminate()
                     recorder.wait(timeout=15)
@@ -257,9 +266,12 @@ class LiveSession:
             self.pool.shutdown(wait=True)
             shutil.rmtree(self.seg_dir, ignore_errors=True)
         watched = time.strftime("%H:%M:%S", time.gmtime(self.watched))
-        reason = "Stopped" if stopping else "Stream ended"
-        db.update("jobs", self.job_id, progress=1.0, payload=self._payload(),
-                  step=f"{reason} · {watched} watched · {self.clips} clips")
+        made = f"{self.clips} {'clip' if self.clips == 1 else 'clips'}"
+        if reached:
+            step = f"Made the {made} you asked for · {watched} watched"
+        else:
+            step = f"{'Stopped' if stopping else 'Stream ended'} · {watched} watched · {made}"
+        db.update("jobs", self.job_id, progress=1.0, payload=self._payload(), step=step)
 
 
 def run_live(job: dict[str, Any]) -> None:

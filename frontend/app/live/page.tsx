@@ -9,6 +9,7 @@ import { JobRow } from "@/components/job-row";
 import { Pagination } from "@/components/pagination";
 import { EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
 import { formatDuration, type ClipSummary, type Job, type Page } from "@/lib/api";
+import { withoutHidden } from "@/lib/optimistic";
 import { usePagedApi } from "@/lib/pagination";
 
 /** Indexes of bars that belong to a run of at least `sustain` bars in a row above the threshold. */
@@ -93,7 +94,7 @@ function LiveSession({ job, onChange }: { job: Job; onChange: () => void }) {
         <div id={`stream-clips-${job.id}`} className="scroll-mt-16 border-t border-line-subtle p-4 md:scroll-mt-4">
           {clips.error ? <ErrorState message={clips.error} onRetry={clips.reload} /> : clips.loading ? <ClipGridSkeleton /> : (
             <div className={CLIP_GRID}>
-              {clips.data?.items.map((clip) => (
+              {withoutHidden(clips.data?.items ?? []).map((clip) => (
                 <ClipCard key={clip.id} clip={clip} />
               ))}
             </div>

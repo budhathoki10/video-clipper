@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& .\\\\scripts\\\\start.ps1)",
+      "PowerShell(try { \\(Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765 -TimeoutSec 10\\).StatusCode } catch { $_.Exception.Message })"
+    ]
+  }
+}

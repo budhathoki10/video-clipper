@@ -3,11 +3,15 @@
 import { ArrowLeft, CalendarClock, Download, ExternalLink, Send, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
+
+import { LayoutOptions } from "@/components/layout-options";
+import { CaptionEditor } from "@/components/caption-editor";
 
 import { Pagination } from "@/components/pagination";
 import { Badge, Button, Dialog, ErrorState, Field, Notice, Score, Section, SkeletonRows, Spinner, Toggle, useToast } from "@/components/ui";
 import { API_URL, api, formatDuration, mediaUrl, useApi, type Clip, type Page, type Panel, type Post, type Settings, type SystemStatus } from "@/lib/api";
+import { hideLocally, showAgain } from "@/lib/optimistic";
 import { usePagedApi } from "@/lib/pagination";
 
 type Draft = {
@@ -140,6 +144,7 @@ function ClipDetail() {
   const [reformatting, setReformatting] = useState(false);
   const [hookIdeas, setHookIdeas] = useState<string[]>([]);
   const [suggesting, setSuggesting] = useState(false);
+  const video = useRef<HTMLVideoElement>(null);
   const defaults = useApi<{ settings: Settings }>("/api/settings");
   const defaultPrivacy = defaults.data?.settings.posting.privacy;
 
@@ -213,12 +218,15 @@ function ClipDetail() {
 
   async function remove() {
     if (!clip) return;
+    const id = clip.id;
+    hideLocally(id);  // gone from the lists now; the server finishes in the background
+    toast("Clip deleted.");
+    router.push("/clips/");
     try {
-      await api(`/api/clips/${clip.id}`, { method: "DELETE" });
-      toast("Clip deleted.");
-      router.push("/clips/");
+      await api(`/api/clips/${id}`, { method: "DELETE" });
     } catch (err) {
-      toast(err instanceof Error ? err.message : "Could not delete.", "bad");
+      showAgain(id);
+      toast(err instanceof Error ? `${err.message} The clip was put back.` : "Could not delete the clip. It was put back.", "bad");
     }
   }
 
@@ -289,7 +297,7 @@ function ClipDetail() {
         <div className="flex flex-col gap-3">
           <div className={`overflow-hidden rounded-lg border border-line bg-ink shadow-soft ${vertical ? "mx-auto w-full max-w-[340px]" : "w-full"}`} style={{ aspectRatio: `${clip.width ?? 9} / ${clip.height ?? 16}` }}>
             {clip.status === "ready" && clip.file_url ? (
-              <video key={clip.file_url} src={mediaUrl(clip.file_url)} poster={mediaUrl(clip.thumb_url)} controls playsInline preload="metadata" className="size-full" aria-label={`Preview of ${clip.title}`} />
+              <video ref={video} key={clip.file_url} src={mediaUrl(clip.file_url)} poster={mediaUrl(clip.thumb_url)} controls playsInline preload="metadata" className="size-full" aria-label={`Preview of ${clip.title}`} />
             ) : clip.status === "failed" ? (
               <div className="flex size-full items-center justify-center p-4 text-center text-sm text-bad-ink">{clip.error || "Render failed."}</div>
             ) : (
@@ -412,9 +420,7 @@ function ClipDetail() {
                 <Field label="Layout" hint="Applies when the source shape differs from the format.">
                   {(p) => (
                     <select {...p} className="field" value={draft.layout} onChange={(e) => edit("layout", e.target.value as Draft["layout"])}>
-                      <option value="auto">Automatic: creator's face on top when there is a webcam</option>
-                      <option value="blur">Whole frame on a blurred background</option>
-                      <option value="crop">Crop to fill the screen</option>
+                      <LayoutOptions />
                     </select>
                   )}
                 </Field>
@@ -440,6 +446,16 @@ function ClipDetail() {
               </div>
             </div>
           </Section>
+
+          <CaptionEditor
+            clip={clip}
+            onClipChange={setData}
+            onSeek={(seconds) => {
+              if (!video.current) return;
+              video.current.currentTime = seconds;
+              void video.current.play().catch(() => undefined);
+            }}
+          />
 
           <Section title="Audience panel" description="How simulated viewers reacted.">
             {clip.panel ? <PanelBreakdown panel={clip.panel} /> : <p className="text-sm text-ink-2">{clip.status === "rendering" ? "The panel runs once the clip has rendered." : "This clip has no panel result. Turn the panel on in Settings, then save a change that renders the clip again."}</p>}

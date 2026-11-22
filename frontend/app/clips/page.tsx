@@ -9,6 +9,7 @@ import { CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
 import { Pagination } from "@/components/pagination";
 import { Button, Dialog, EmptyState, ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
 import type { ClipSummary, Job, Page } from "@/lib/api";
+import { withoutHidden } from "@/lib/optimistic";
 import { useDebouncedSearch, usePagedApi } from "@/lib/pagination";
 
 type Sort = "score" | "newest" | "shortest" | "longest";
@@ -142,7 +143,7 @@ function Library() {
         />
       ) : (
         <div className={CLIP_GRID}>
-          {clips.data?.items.map((clip) => (
+          {withoutHidden(clips.data?.items ?? []).map((clip) => (
             <ClipCard key={clip.id} clip={clip} />
           ))}
         </div>
